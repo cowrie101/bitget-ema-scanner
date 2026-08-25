@@ -145,26 +145,21 @@ def get_candles(symbol):
 # ============================================================
 # CREATE DATAFRAME
 # ============================================================
-
 def make_dataframe(rows):
-
-    # Bitget may return 7 or 8 fields.
-    # We only need the first 7 fields for EMA calculation.
 
     cleaned_rows = []
 
     for row in rows:
-
         if len(row) >= 7:
             cleaned_rows.append(row[:7])
 
-    rows = sorted(
+    cleaned_rows = sorted(
         cleaned_rows,
         key=lambda x: int(x[0])
     )
 
     df = pd.DataFrame(
-        rows,
+        cleaned_rows,
         columns=[
             "ts",
             "open",
@@ -184,7 +179,6 @@ def make_dataframe(rows):
         "volume",
         "quote_volume"
     ]:
-
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce"
@@ -200,7 +194,6 @@ def make_dataframe(rows):
     )
 
     return df
-
 # ============================================================
 # CALCULATE CROSS
 #
