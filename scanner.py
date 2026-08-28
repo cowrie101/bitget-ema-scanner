@@ -1,57 +1,131 @@
 import os
 import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 
 
 # ============================================================
-# BITGET EMA 20/50 - FAST SCANNER v3
-# 30-MINUTE FORMING + CLOSED CANDLE
-# EMA + VOLUME + ADX + MARKET STRUCTURE + RSI
+# BITGET EMA / ADX / MARKET STRUCTURE / VOLUME SCANNER
 # ============================================================
 
-BITGET_SYMBOLS = "https://api.bitget.com/api/v2/spot/public/symbols"
-BITGET_CANDLES = "https://api.bitget.com/api/v2/spot/market/candles"
-TELEGRAM_SEND = "https://api.telegram.org/bot{}/sendMessage"
+BITGET_SYMBOLS = (
+    "https://api.bitget.com/api/v2/spot/public/symbols"
+)
+
+BITGET_CANDLES = (
+    "https://api.bitget.com/api/v2/spot/market/history-candles"
+)
+
+TELEGRAM_SEND = (
+    "https://api.telegram.org/bot{}/sendMessage"
+)
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 EMA_FAST = 20
 EMA_SLOW = 50
+
 GRANULARITY = "30min"
+
 CANDLE_LIMIT = 200
 
-MAX_WORKERS = 10
-EMA_APPROACH_PERCENT = 0.20
-ADX_MIN = 20
-VOLUME_LOOKBACK = 20
-VOLUME_MULTIPLIER = 1.20
+# Scan every 5 minutes
+SCAN_INTERVAL = 5 * 60
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# How close EMA20 must be to EMA50 before we call it
+# an "IMPENDING CROSS".
+#
+# 0.15 means EMA20 is within approximately 0.15%
+# of EMA50.
+IMPENDING_CROSS_PERCENT = 0.15
+
+# ADX settings
+ADX_PERIOD = 14
+
+# Volume settings
+VOLUME_LOOKBACK = 20
+
+# Market structure settings
+STRUCTURE_LOOKBACK = 5
+
+
+# ============================================================
+# TELEGRAM SECRETS
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.environ.get(
+    "TELEGRAM_BOT_TOKEN"
+)
+
+TELEGRAM_CHAT_ID = os.environ.get(
+    "TELEGRAM_CHAT_ID"
+)
+
+
+# ============================================================
+# SESSION
+# ============================================================
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Bitget-EMA-Scanner/3.0"})
+
+session.headers.update({
+    "User-Agent": "Bitget-EMA-ADX-Scanner/3.0"
+})
+
+
+# ============================================================
+# MEMORY
+#
+# Prevents the same developing cross from sending a Telegram
+# alert every 5 minutes.
+# ============================================================
+
+last_alert_state = {}
+
+
 # ============================================================
 # GET ALL ONLINE USDT SPOT PAIRS
 # ============================================================
 
 def get_symbols():
-    response = session.get(BITGET_SYMBOLS, timeout=20)
+
+    response = session.get(
+        BITGET_SYMBOLS,
+        timeout=20
+    )
+
     response.raise_for_status()
+
     data = response.json()
 
     if data.get("code") != "00000":
-        raise RuntimeError(f"Bitget symbols error: {data}")
 
-    return sorted(set(
-        item.get("symbol", "")
-        for item in data.get("data", [])
-        if item.get("quoteCoin") == "USDT"
-        and item.get("status") == "online"
-        and item.get("symbol", "").endswith("USDT")
-    ))
+        raise RuntimeError(
+            f"Bitget symbols error: {data}"
+        )
+
+    symbols = []
+
+    for item in data.get("data", []):
+
+        symbol = item.get("symbol", "")
+        quote_coin = item.get("quoteCoin", "")
+        status = item.get("status", "")
+
+        if (
+            quote_coin == "USDT"
+            and status == "online"
+            and symbol.endswith("USDT")
+        ):
+
+            symbols.append(symbol)
+
+    return sorted(set(symbols))
 
 
 # ============================================================
@@ -59,60 +133,100 @@ def get_symbols():
 # ============================================================
 
 def get_candles(symbol):
+
+    end_time = int(
+        time.time() * 1000
+    )
+
     params = {
         "symbol": symbol,
         "granularity": GRANULARITY,
-        "limit": str(CANDLE_LIMIT),
+        "endTime": str(end_time),
+        "limit": str(CANDLE_LIMIT)
     }
 
     for attempt in range(3):
+
         try:
+
             response = session.get(
                 BITGET_CANDLES,
                 params=params,
-                timeout=15
+                timeout=20
             )
 
-            if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep(1.5 * (attempt + 1))
+            if response.status_code in (
+                429,
+                500,
+                502,
+                503,
+                504
+            ):
+
+                time.sleep(2 + attempt)
+
                 continue
 
             if response.status_code == 400:
+
                 return None
 
             response.raise_for_status()
+
             data = response.json()
 
             if data.get("code") != "00000":
+
                 return None
 
             rows = data.get("data", [])
 
-            if len(rows) < EMA_SLOW + 5:
+            if len(rows) < EMA_SLOW + 10:
+
                 return None
 
             return rows
 
-        except requests.RequestException:
+        except requests.RequestException as error:
+
             if attempt == 2:
+
+                print(
+                    f"{symbol}: request failed: {error}"
+                )
+
                 return None
 
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(2 + attempt)
 
     return None
 
 
 # ============================================================
 # CREATE DATAFRAME
+#
+# Bitget can return rows with more than 7 fields.
+# We only use the first 7 required fields.
 # ============================================================
 
 def make_dataframe(rows):
-    cleaned_rows = [
-        row[:7] for row in rows
-        if len(row) >= 7
-    ]
 
-    cleaned_rows.sort(
+    cleaned_rows = []
+
+    for row in rows:
+
+        if len(row) >= 7:
+
+            cleaned_rows.append(
+                row[:7]
+            )
+
+    if not cleaned_rows:
+
+        return pd.DataFrame()
+
+    cleaned_rows = sorted(
+        cleaned_rows,
         key=lambda x: int(x[0])
     )
 
@@ -129,14 +243,17 @@ def make_dataframe(rows):
         ]
     )
 
-    for column in [
+    numeric_columns = [
         "open",
         "high",
         "low",
         "close",
         "volume",
         "quote_volume"
-    ]:
+    ]
+
+    for column in numeric_columns:
+
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce"
@@ -147,7 +264,7 @@ def make_dataframe(rows):
         errors="coerce"
     )
 
-    return df.dropna(
+    df = df.dropna(
         subset=[
             "ts",
             "open",
@@ -157,57 +274,15 @@ def make_dataframe(rows):
             "volume"
         ]
     )
+
+    return df
+
+
 # ============================================================
-# INDICATORS
+# CALCULATE ADX
 # ============================================================
 
-def add_indicators(df):
-
-    # EMA 20
-    df["ema20"] = df["close"].ewm(
-        span=EMA_FAST,
-        adjust=False
-    ).mean()
-
-    # EMA 50
-    df["ema50"] = df["close"].ewm(
-        span=EMA_SLOW,
-        adjust=False
-    ).mean()
-
-
-    # ========================================================
-    # RSI 14
-    # ========================================================
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        pd.NA
-    )
-
-    df["rsi"] = (
-        100 - (100 / (1 + rs))
-    ).fillna(50)
-
-
-    # ========================================================
-    # ADX 14
-    # ========================================================
+def calculate_adx(df, period=14):
 
     high = df["high"]
     low = df["low"]
@@ -215,348 +290,407 @@ def add_indicators(df):
 
     previous_close = close.shift(1)
 
+    tr1 = high - low
+
+    tr2 = (
+        high - previous_close
+    ).abs()
+
+    tr3 = (
+        low - previous_close
+    ).abs()
+
     true_range = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs()
-        ],
+        [tr1, tr2, tr3],
         axis=1
     ).max(axis=1)
 
-    up_move = high.diff()
-    down_move = -low.diff()
+    up_move = (
+        high - high.shift(1)
+    )
+
+    down_move = (
+        low.shift(1) - low
+    )
 
     plus_dm = up_move.where(
         (up_move > down_move)
         & (up_move > 0),
-        0
+        0.0
     )
 
     minus_dm = down_move.where(
         (down_move > up_move)
         & (down_move > 0),
-        0
+        0.0
     )
 
     atr = true_range.ewm(
-        alpha=1 / 14,
+        alpha=1 / period,
         adjust=False
     ).mean()
 
     plus_di = (
         100
         * plus_dm.ewm(
-            alpha=1 / 14,
+            alpha=1 / period,
             adjust=False
         ).mean()
-        / atr.replace(0, pd.NA)
+        / atr
     )
 
     minus_di = (
         100
         * minus_dm.ewm(
-            alpha=1 / 14,
+            alpha=1 / period,
             adjust=False
         ).mean()
-        / atr.replace(0, pd.NA)
+        / atr
+    )
+
+    denominator = (
+        plus_di + minus_di
     )
 
     dx = (
         100
         * (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(
-            0,
-            pd.NA
-        )
+        / denominator
     )
 
-    df["adx"] = dx.ewm(
-        alpha=1 / 14,
+    adx = dx.ewm(
+        alpha=1 / period,
         adjust=False
-    ).mean().fillna(0)
-
-    df["plus_di"] = plus_di.fillna(0)
-    df["minus_di"] = minus_di.fillna(0)
-
-
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    df["volume_avg"] = df["volume"].rolling(
-        VOLUME_LOOKBACK
     ).mean()
 
+    return (
+        pd.to_numeric(
+            adx,
+            errors="coerce"
+        ).fillna(0),
 
-    # ========================================================
-    # MARKET STRUCTURE
-    # ========================================================
+        pd.to_numeric(
+            plus_di,
+            errors="coerce"
+        ).fillna(0),
 
-    df["recent_high"] = df["high"].rolling(
-        5
-    ).max()
+        pd.to_numeric(
+            minus_di,
+            errors="coerce"
+        ).fillna(0)
+    )
 
-    df["previous_high"] = df["high"].shift(
-        5
-    ).rolling(
-        5
-    ).max()
 
-    df["recent_low"] = df["low"].rolling(
-        5
-    ).min()
-
-    df["previous_low"] = df["low"].shift(
-        5
-    ).rolling(
-        5
-    ).min()
-
-    return df
 # ============================================================
-# ANALYZE ONE SYMBOL
+# MARKET STRUCTURE
+#
+# Simple structure assessment:
+#
+# BULLISH  = recent highs/lows rising
+# BEARISH  = recent highs/lows falling
+# NEUTRAL  = mixed
 # ============================================================
 
-def analyze_symbol(symbol):
+def get_market_structure(df):
+
+    lookback = STRUCTURE_LOOKBACK
+
+    if len(df) < lookback * 2 + 2:
+
+        return "NEUTRAL"
+
+    recent = df.iloc[-lookback:]
+
+    previous = df.iloc[
+        -(lookback * 2):-lookback
+    ]
+
+    recent_high = recent["high"].max()
+    previous_high = previous["high"].max()
+
+    recent_low = recent["low"].min()
+    previous_low = previous["low"].min()
+
+    if (
+        recent_high > previous_high
+        and recent_low > previous_low
+    ):
+
+        return "BULLISH"
+
+    if (
+        recent_high < previous_high
+        and recent_low < previous_low
+    ):
+
+        return "BEARISH"
+
+    return "NEUTRAL"
+
+
+# ============================================================
+# VOLUME ANALYSIS
+# ============================================================
+
+def get_volume_status(df):
+
+    if len(df) < VOLUME_LOOKBACK + 1:
+
+        return "NORMAL", 0.0
+
+    current_volume = float(
+        df.iloc[-1]["volume"]
+    )
+
+    average_volume = float(
+        df["volume"]
+        .iloc[
+            -VOLUME_LOOKBACK - 1:-1
+        ]
+        .mean()
+    )
+
+    if average_volume <= 0:
+
+        return "NORMAL", 0.0
+
+    ratio = (
+        current_volume
+        / average_volume
+    )
+
+    if ratio >= 1.5:
+
+        status = "HIGH"
+
+    elif ratio >= 1.15:
+
+        status = "ABOVE AVERAGE"
+
+    elif ratio <= 0.70:
+
+        status = "LOW"
+
+    else:
+
+        status = "NORMAL"
+
+    return status, ratio
+
+
+# ============================================================
+# CHECK CROSS / IMPENDING CROSS
+# ============================================================
+
+def check_setup(symbol):
 
     rows = get_candles(symbol)
 
     if not rows:
+
         return None
 
     df = make_dataframe(rows)
 
-    if len(df) < EMA_SLOW + 20:
+    if df.empty:
+
         return None
 
-    df = add_indicators(df)
+    if len(df) < EMA_SLOW + 20:
+
+        return None
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    df["ema20"] = df["close"].ewm(
+        span=EMA_FAST,
+        adjust=False
+    ).mean()
+
+    df["ema50"] = df["close"].ewm(
+        span=EMA_SLOW,
+        adjust=False
+    ).mean()
+
+    # --------------------------------------------------------
+    # ADX
+    # --------------------------------------------------------
+
+    (
+        df["adx"],
+        df["plus_di"],
+        df["minus_di"]
+    ) = calculate_adx(
+        df,
+        ADX_PERIOD
+    )
 
     previous = df.iloc[-2]
     current = df.iloc[-1]
 
-    ema20 = float(current["ema20"])
-    ema50 = float(current["ema50"])
-
-    if ema50 == 0:
-        return None
-
-    # Distance between EMA20 and EMA50
-    distance = (
-        abs(ema20 - ema50)
-        / abs(ema50)
-        * 100
+    previous_ema20 = float(
+        previous["ema20"]
     )
 
-    # ========================================================
-    # ACTUAL CROSS
-    # ========================================================
-
-    golden = (
-        previous["ema20"] <= previous["ema50"]
-        and current["ema20"] > current["ema50"]
+    previous_ema50 = float(
+        previous["ema50"]
     )
 
-    death = (
-        previous["ema20"] >= previous["ema50"]
-        and current["ema20"] < current["ema50"]
+    current_ema20 = float(
+        current["ema20"]
     )
 
-    # ========================================================
-    # EARLY CROSSOVER WARNING
-    # ========================================================
-
-    early_golden = (
-        not golden
-        and ema20 < ema50
-        and distance <= EMA_APPROACH_PERCENT
-        and current["close"] >= ema20
+    current_ema50 = float(
+        current["ema50"]
     )
 
-    early_death = (
-        not death
-        and ema20 > ema50
-        and distance <= EMA_APPROACH_PERCENT
-        and current["close"] <= ema20
+    current_price = float(
+        current["close"]
     )
 
-    # ========================================================
-    # DETERMINE SIGNAL
-    # ========================================================
-
-    if golden:
-
-        direction = "GOLDEN CROSS"
-        early = False
-
-    elif death:
-
-        direction = "DEATH CROSS"
-        early = False
-
-    elif early_golden:
-
-        direction = "GOLDEN CROSS APPROACHING"
-        early = True
-
-    elif early_death:
-
-        direction = "DEATH CROSS APPROACHING"
-        early = True
-
-    else:
-
-        return None
-
-
-    # ========================================================
-    # VOLUME
-    # ========================================================
-
-    volume_avg = current["volume_avg"]
-
-    if (
-        pd.notna(volume_avg)
-        and volume_avg > 0
-    ):
-
-        volume_ratio = float(
-            current["volume"]
-            / volume_avg
-        )
-
-    else:
-
-        volume_ratio = 0
-
-
-    volume_confirmed = (
-        volume_ratio >= VOLUME_MULTIPLIER
-    )
-
-
-    # ========================================================
-    # ADX
-    # ========================================================
-
-    adx = float(
+    current_adx = float(
         current["adx"]
     )
 
-    adx_confirmed = (
-        adx >= ADX_MIN
+    current_plus_di = float(
+        current["plus_di"]
     )
 
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    rsi = float(
-        current["rsi"]
+    current_minus_di = float(
+        current["minus_di"]
     )
 
+    # --------------------------------------------------------
+    # EMA DISTANCE
+    # --------------------------------------------------------
 
-    # ========================================================
+    if current_ema50 == 0:
+
+        return None
+
+    ema_distance_percent = (
+        abs(
+            current_ema20
+            - current_ema50
+        )
+        / current_ema50
+    ) * 100
+
+    # --------------------------------------------------------
+    # ACTUAL CROSS
+    # --------------------------------------------------------
+
+    golden_cross = (
+        previous_ema20
+        <= previous_ema50
+        and current_ema20
+        > current_ema50
+    )
+
+    death_cross = (
+        previous_ema20
+        >= previous_ema50
+        and current_ema20
+        < current_ema50
+    )
+
+    # --------------------------------------------------------
+    # IMPENDING CROSS
+    #
+    # EMA20 has not crossed yet, but is approaching EMA50.
+    # --------------------------------------------------------
+
+    impending_golden = (
+        current_ema20
+        < current_ema50
+        and ema_distance_percent
+        <= IMPENDING_CROSS_PERCENT
+    )
+
+    impending_death = (
+        current_ema20
+        > current_ema50
+        and ema_distance_percent
+        <= IMPENDING_CROSS_PERCENT
+    )
+
+    if golden_cross:
+
+        signal = "GOLDEN CROSS"
+        direction = "BULLISH"
+
+    elif death_cross:
+
+        signal = "DEATH CROSS"
+        direction = "BEARISH"
+
+    elif impending_golden:
+
+        signal = "IMPENDING GOLDEN CROSS"
+        direction = "BULLISH"
+
+    elif impending_death:
+
+        signal = "IMPENDING DEATH CROSS"
+        direction = "BEARISH"
+
+    else:
+
+        return None
+
+    # --------------------------------------------------------
     # MARKET STRUCTURE
-    # ========================================================
+    # --------------------------------------------------------
 
-    if "GOLDEN" in direction:
+    structure = get_market_structure(
+        df
+    )
 
-        bullish_structure = (
-            current["recent_high"]
-            > current["previous_high"]
-            and
-            current["recent_low"]
-            > current["previous_low"]
-        )
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
 
-        structure = (
-            "BULLISH"
-            if bullish_structure
-            else "MIXED"
-        )
+    volume_status, volume_ratio = (
+        get_volume_status(df)
+    )
 
-        di_confirmed = (
-            current["plus_di"]
-            > current["minus_di"]
-        )
+    # --------------------------------------------------------
+    # ADX TREND STRENGTH
+    # --------------------------------------------------------
 
-        rsi_confirmed = (
-            rsi >= 50
-        )
+    if current_adx >= 25:
 
-    else:
+        adx_strength = "STRONG TREND"
 
-        bearish_structure = (
-            current["recent_high"]
-            < current["previous_high"]
-            and
-            current["recent_low"]
-            < current["previous_low"]
-        )
+    elif current_adx >= 20:
 
-        structure = (
-            "BEARISH"
-            if bearish_structure
-            else "MIXED"
-        )
-
-        di_confirmed = (
-            current["minus_di"]
-            > current["plus_di"]
-        )
-
-        rsi_confirmed = (
-            rsi <= 50
-        )
-
-
-    # ========================================================
-    # SIGNAL SCORE
-    # ========================================================
-
-    score = 0
-
-    if volume_confirmed:
-        score += 1
-
-    if adx_confirmed:
-        score += 1
-
-    if structure in (
-        "BULLISH",
-        "BEARISH"
-    ):
-        score += 1
-
-    if rsi_confirmed:
-        score += 1
-
-    if di_confirmed:
-        score += 1
-
-
-    # ========================================================
-    # SIGNAL GRADE
-    # ========================================================
-
-    if score >= 4:
-
-        grade = "A - STRONG"
-
-    elif score >= 2:
-
-        grade = "B - DEVELOPING"
+        adx_strength = "DEVELOPING TREND"
 
     else:
 
-        grade = "C - EARLY / WEAK"
+        adx_strength = "WEAK / RANGE"
 
+    # --------------------------------------------------------
+    # DI DIRECTION
+    # --------------------------------------------------------
 
-    # ========================================================
+    if current_plus_di > current_minus_di:
+
+        di_direction = "BULLISH"
+
+    elif current_minus_di > current_plus_di:
+
+        di_direction = "BEARISH"
+
+    else:
+
+        di_direction = "NEUTRAL"
+
+    # --------------------------------------------------------
     # CANDLE STATUS
-    # ========================================================
+    # --------------------------------------------------------
 
     interval_ms = (
         30 * 60 * 1000
@@ -573,65 +707,86 @@ def analyze_symbol(symbol):
 
     if candle_timestamp >= current_bucket:
 
-        status = "INTRABAR"
+        candle_status = "FORMING"
 
     else:
 
-        status = "CANDLE CLOSED"
-
-
-    # ========================================================
-    # CANDLE TIME
-    # ========================================================
+        candle_status = "CLOSED"
 
     candle_time = datetime.fromtimestamp(
         candle_timestamp / 1000,
         tz=timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M UTC"
     )
 
+    # --------------------------------------------------------
+    # SIMPLE CONFLUENCE REPORT
+    #
+    # This does NOT automatically declare a trade.
+    # It gives the trader the information.
+    # --------------------------------------------------------
 
-    # ========================================================
-    # RETURN SIGNAL
-    # ========================================================
+    confirmations = 0
+
+    if direction == "BULLISH":
+
+        if structure == "BULLISH":
+            confirmations += 1
+
+        if current_plus_di > current_minus_di:
+            confirmations += 1
+
+    if direction == "BEARISH":
+
+        if structure == "BEARISH":
+            confirmations += 1
+
+        if current_minus_di > current_plus_di:
+            confirmations += 1
+
+    if current_adx >= 20:
+        confirmations += 1
+
+    if volume_ratio >= 1.15:
+        confirmations += 1
+
+    if confirmations >= 3:
+
+        confluence = "HIGHER CONFLUENCE"
+
+    elif confirmations == 2:
+
+        confluence = "MODERATE CONFLUENCE"
+
+    else:
+
+        confluence = "LOW CONFLUENCE"
 
     return {
-
         "symbol": symbol,
-
+        "signal": signal,
         "direction": direction,
-
-        "status": status,
-
-        "early": early,
-
-        "candle_time": candle_time,
-
-        "price": float(
-            current["close"]
+        "status": candle_status,
+        "candle_time": candle_time.strftime(
+            "%Y-%m-%d %H:%M UTC"
         ),
-
-        "ema20": ema20,
-
-        "ema50": ema50,
-
-        "distance": distance,
-
-        "volume_ratio": volume_ratio,
-
-        "adx": adx,
-
-        "rsi": rsi,
-
+        "price": current_price,
+        "ema20": current_ema20,
+        "ema50": current_ema50,
+        "ema_distance": ema_distance_percent,
+        "adx": current_adx,
+        "plus_di": current_plus_di,
+        "minus_di": current_minus_di,
+        "adx_strength": adx_strength,
+        "di_direction": di_direction,
         "structure": structure,
-
-        "score": score,
-
-        "grade": grade
+        "volume_status": volume_status,
+        "volume_ratio": volume_ratio,
+        "confluence": confluence
     }
+
+
 # ============================================================
-# SEND TELEGRAM MESSAGE
+# TELEGRAM
 # ============================================================
 
 def send_telegram(message):
@@ -684,23 +839,23 @@ def send_telegram(message):
 
         return True
 
-    except requests.RequestException as e:
+    except requests.RequestException as error:
 
         print(
             "Telegram error:",
-            e
+            error
         )
 
         return False
 
 
 # ============================================================
-# BUILD TELEGRAM MESSAGE
+# FORMAT TELEGRAM ALERT
 # ============================================================
 
-def build_message(signal):
+def format_message(signal):
 
-    if "GOLDEN" in signal["direction"]:
+    if signal["direction"] == "BULLISH":
 
         emoji = "🟢"
 
@@ -708,212 +863,182 @@ def build_message(signal):
 
         emoji = "🔴"
 
+    message = (
+        f"{emoji} {signal['signal']}\n\n"
 
-    if signal["early"]:
+        f"Pair: {signal['symbol']}\n"
+        f"Timeframe: 30 MINUTES\n"
+        f"Candle: {signal['status']}\n"
+        f"Time: {signal['candle_time']}\n\n"
 
-        title = (
-            f"{emoji} EARLY "
-            f"{signal['direction']}"
-        )
+        f"PRICE\n"
+        f"{signal['price']:.8g}\n\n"
 
-    else:
+        f"EMA\n"
+        f"EMA20: {signal['ema20']:.8g}\n"
+        f"EMA50: {signal['ema50']:.8g}\n"
+        f"Distance: "
+        f"{signal['ema_distance']:.4f}%\n\n"
 
-        title = (
-            f"{emoji} "
-            f"{signal['direction']}"
-        )
+        f"ADX\n"
+        f"ADX: {signal['adx']:.2f}\n"
+        f"+DI: {signal['plus_di']:.2f}\n"
+        f"-DI: {signal['minus_di']:.2f}\n"
+        f"Trend: {signal['adx_strength']}\n"
+        f"DI Direction: {signal['di_direction']}\n\n"
 
-
-    return (
-        f"{title}\n\n"
-
-        f"Pair: "
-        f"{signal['symbol']}\n"
-
-        f"Timeframe: "
-        f"30 MINUTES\n"
-
-        f"Status: "
-        f"{signal['status']}\n"
-
-        f"Candle: "
-        f"{signal['candle_time']}\n\n"
-
-        f"Price: "
-        f"{signal['price']:.8g}\n"
-
-        f"EMA20: "
-        f"{signal['ema20']:.8g}\n"
-
-        f"EMA50: "
-        f"{signal['ema50']:.8g}\n"
-
-        f"EMA distance: "
-        f"{signal['distance']:.3f}%\n\n"
-
-        f"Volume: "
-        f"{signal['volume_ratio']:.2f}x average\n"
-
-        f"ADX: "
-        f"{signal['adx']:.1f}\n"
-
-        f"RSI: "
-        f"{signal['rsi']:.1f}\n"
-
-        f"Structure: "
+        f"MARKET STRUCTURE\n"
         f"{signal['structure']}\n\n"
 
-        f"Setup grade: "
-        f"{signal['grade']}\n\n"
+        f"VOLUME\n"
+        f"Status: {signal['volume_status']}\n"
+        f"Ratio: "
+        f"{signal['volume_ratio']:.2f}x average\n\n"
+
+        f"CONFLUENCE\n"
+        f"{signal['confluence']}\n\n"
 
         f"Bitget Spot"
     )
+
+    return message
+
+
 # ============================================================
-# MAIN SCANNER
+# SCAN ALL PAIRS
 # ============================================================
 
-def main():
+def scan_market():
 
     print("=" * 65)
 
     print(
-        "BITGET EMA20 / EMA50 FAST 30-MINUTE SCANNER v3"
+        "BITGET EMA20 / EMA50 + ADX + STRUCTURE + VOLUME"
     )
 
     print(
-        "EARLY + INTRABAR + CLOSED CANDLE MODE"
-    )
-
-    print(
-        "EMA + VOLUME + ADX + MARKET STRUCTURE + RSI"
+        "30-MINUTE FORMING-CANDLE EARLY WARNING SCANNER"
     )
 
     print("=" * 65)
 
-    start = time.time()
+    stamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    print(
+        "Scan started:",
+        stamp
+    )
 
     symbols = get_symbols()
 
     print(
         f"Scanning {len(symbols)} "
-        f"online USDT Spot pairs "
-        f"with {MAX_WORKERS} workers..."
+        f"online USDT Spot pairs..."
     )
 
-    signals = []
+    print()
 
-    # --------------------------------------------------------
-    # SCAN MANY PAIRS AT THE SAME TIME
-    # --------------------------------------------------------
+    alerts_sent = 0
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
+    for number, symbol in enumerate(
+        symbols,
+        1
+    ):
 
-        futures = {
-            executor.submit(
-                analyze_symbol,
+        try:
+
+            result = check_setup(
                 symbol
-            ): symbol
-            for symbol in symbols
-        }
+            )
 
-        completed = 0
+            if result:
 
-        for future in as_completed(
-            futures
-        ):
+                print(
+                    f"{result['signal']} | "
+                    f"{result['status']} | "
+                    f"{symbol} | "
+                    f"ADX {result['adx']:.1f} | "
+                    f"Structure "
+                    f"{result['structure']} | "
+                    f"Volume "
+                    f"{result['volume_status']}"
+                )
 
-            completed += 1
+                # ------------------------------------------------
+                # ALERT DEDUPLICATION
+                #
+                # Only alert again if the signal state changes.
+                # ------------------------------------------------
 
-            symbol = futures[future]
+                state_key = (
+                    result["signal"]
+                    + "|"
+                    + result["status"]
+                )
 
-            try:
+                previous_state = (
+                    last_alert_state.get(
+                        symbol
+                    )
+                )
 
-                result = future.result()
+                if previous_state != state_key:
 
-                if result:
-
-                    signals.append(
+                    message = format_message(
                         result
                     )
 
-                    print(
-                        f"{result['direction']} | "
-                        f"{result['status']} | "
-                        f"{symbol} | "
-                        f"Grade "
-                        f"{result['grade']}"
-                    )
+                    if send_telegram(
+                        message
+                    ):
 
-            except Exception as e:
+                        alerts_sent += 1
 
-                print(
-                    f"{symbol}: {e}"
+                        last_alert_state[
+                            symbol
+                        ] = state_key
+
+                        print(
+                            "Telegram alert sent:",
+                            symbol
+                        )
+
+            else:
+
+                # If there is no active setup,
+                # clear the previous state.
+                last_alert_state.pop(
+                    symbol,
+                    None
                 )
 
-            if completed % 100 == 0:
+        except Exception as error:
 
-                print(
-                    f"Progress: "
-                    f"{completed}/"
-                    f"{len(symbols)}"
-                )
-
-
-    # --------------------------------------------------------
-    # SORT STRONGEST SIGNALS FIRST
-    # --------------------------------------------------------
-
-    signals.sort(
-        key=lambda x: (
-            -x["score"],
-            x["symbol"]
-        )
-    )
-
-
-    scan_time = (
-        time.time() - start
-    )
-
-    print(
-        f"Scan completed in "
-        f"{scan_time:.1f} seconds."
-    )
-
-
-    # --------------------------------------------------------
-    # SEND TELEGRAM ALERTS
-    # --------------------------------------------------------
-
-    if signals:
-
-        for signal in signals:
-
-            message = build_message(
-                signal
+            print(
+                f"{symbol}: {error}"
             )
 
-            if send_telegram(
-                message
-            ):
+        # Keep requests comfortably below
+        # Bitget's documented request rate.
+        time.sleep(0.06)
 
-                print(
-                    "Telegram alert sent:",
-                    signal["symbol"]
-                )
+        if number % 100 == 0:
 
-    else:
-
-        print(
-            "No EMA20/EMA50 developing "
-            "or confirmed signals detected "
-            "during this scan."
-        )
-
+            print(
+                f"Progress: "
+                f"{number}/{len(symbols)}"
+            )
 
     print()
+
+    print(
+        f"Alerts sent this scan: "
+        f"{alerts_sent}"
+    )
 
     print(
         "SCAN COMPLETE"
@@ -921,7 +1046,93 @@ def main():
 
 
 # ============================================================
-# START PROGRAM
+# CONTINUOUS 5-MINUTE LOOP
+# ============================================================
+
+def main():
+
+    print()
+    print(
+        "BOT STARTED"
+    )
+
+    print(
+        "Automatic scan interval: "
+        "EVERY 5 MINUTES"
+    )
+
+    print(
+        "RSI: DISABLED"
+    )
+
+    print(
+        "EMA20/EMA50: ENABLED"
+    )
+
+    print(
+        "ADX: ENABLED"
+    )
+
+    print(
+        "MARKET STRUCTURE: ENABLED"
+    )
+
+    print(
+        "VOLUME: ENABLED"
+    )
+
+    print()
+
+    while True:
+
+        scan_start = time.time()
+
+        try:
+
+            scan_market()
+
+        except Exception as error:
+
+            print(
+                "SCAN ERROR:",
+                error
+            )
+
+        elapsed = (
+            time.time()
+            - scan_start
+        )
+
+        wait_time = max(
+            10,
+            SCAN_INTERVAL - elapsed
+        )
+
+        next_scan = datetime.fromtimestamp(
+            time.time() + wait_time,
+            tz=timezone.utc
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+
+        print()
+
+        print(
+            f"Next automatic scan: "
+            f"{next_scan}"
+        )
+
+        print(
+            "Waiting 5 minutes..."
+        )
+
+        time.sleep(
+            wait_time
+        )
+
+
+# ============================================================
+# START
 # ============================================================
 
 if __name__ == "__main__":
