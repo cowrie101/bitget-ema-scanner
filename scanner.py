@@ -90,17 +90,6 @@ CANDLE_LIMIT = 200
 
 # ============================================================
 # IMPENDING CROSS
-#
-# Example:
-#
-# EMA20 is still below EMA50 but very close
-# AND EMA20 is moving upward.
-#
-# This produces:
-#
-# IMPENDING GOLDEN CROSS
-#
-# Same idea in reverse for death cross.
 # ============================================================
 
 IMPENDING_CROSS_PERCENT = 0.15
@@ -110,20 +99,10 @@ IMPENDING_CROSS_PERCENT = 0.15
 # TREND SETTINGS
 # ============================================================
 
-# Number of candles used to measure EMA movement.
 TREND_LOOKBACK = 5
 
-
-# Minimum EMA50 movement required to consider
-# the market directional rather than flat.
-#
-# This is intentionally modest because crypto pairs
-# can have very different price behaviour.
 MIN_EMA50_SLOPE_PERCENT = 0.03
 
-
-# Minimum EMA20 movement required to confirm
-# directional momentum.
 MIN_EMA20_SLOPE_PERCENT = 0.03
 
 
@@ -138,8 +117,6 @@ STRUCTURE_LOOKBACK = 5
 # WEBSOCKET SETTINGS
 # ============================================================
 
-# Bitget allows multiple subscriptions per connection.
-# 40 keeps the connection comfortably sized.
 WS_PAIRS_PER_CONNECTION = 40
 
 WS_PING_INTERVAL = 20
@@ -180,7 +157,8 @@ TELEGRAM_CHAT_ID = os.environ.get(
 session = requests.Session()
 
 session.headers.update({
-    "User-Agent": "Bitget-EMA20-EMA50-WebSocket-Scanner/5.0"
+    "User-Agent":
+        "Bitget-EMA20-EMA50-WebSocket-Scanner/6.0"
 })
 
 
@@ -202,7 +180,7 @@ def get_thread_session():
 
         thread_local.session.headers.update({
             "User-Agent":
-                "Bitget-EMA20-EMA50-WebSocket-Scanner/5.0"
+                "Bitget-EMA20-EMA50-WebSocket-Scanner/6.0"
         })
 
     return thread_local.session
@@ -251,13 +229,11 @@ def wait_for_request_slot():
 
 # ============================================================
 # SHARED CANDLE STORAGE
-#
-# candles[symbol] = deque of historical + live candles
 # ============================================================
 
 candles = {}
 
-candles_lock = threading.Lock()
+candles_lock = threading.RLock()
 
 
 # ============================================================
@@ -272,13 +248,13 @@ ws_candle_messages = 0
 
 ws_connections_live = 0
 
+ws_subscriptions = 0
+
 ws_lock = threading.Lock()
 
 
 # ============================================================
 # LAST ALERT STATE
-#
-# Prevents repeated Telegram alerts for the same setup.
 # ============================================================
 
 last_alert_state = {}
@@ -292,7 +268,9 @@ alert_lock = threading.Lock()
 
 def get_symbols():
 
-    print("Getting Bitget Spot USDT symbols...")
+    print(
+        "Getting Bitget Spot USDT symbols..."
+    )
 
     response = session.get(
         BITGET_SYMBOLS,
@@ -311,7 +289,10 @@ def get_symbols():
 
     symbols = []
 
-    for item in data.get("data", []):
+    for item in data.get(
+        "data",
+        []
+    ):
 
         symbol = item.get(
             "symbol",
@@ -334,7 +315,9 @@ def get_symbols():
             and symbol.endswith("USDT")
         ):
 
-            symbols.append(symbol)
+            symbols.append(
+                symbol
+            )
 
     symbols = sorted(
         set(symbols)
@@ -572,11 +555,15 @@ def initialize_history(symbols):
 
     print()
     print("=" * 70)
-    print("INITIALIZING HISTORICAL EMA DATA")
+    print(
+        "INITIALIZING HISTORICAL EMA DATA"
+    )
     print("=" * 70)
 
     successful = 0
+
     failed = 0
+
     completed = 0
 
     start = time.monotonic()
@@ -650,6 +637,7 @@ def initialize_history(symbols):
     )
 
     print()
+
     print(
         f"Historical EMA data ready: "
         f"{successful}/{len(symbols)}"
@@ -665,12 +653,6 @@ def initialize_history(symbols):
 
 # ============================================================
 # MARKET STRUCTURE
-#
-# Uses higher highs / higher lows or lower highs /
-# lower lows.
-#
-# No ADX.
-# No volume.
 # ============================================================
 
 def get_market_structure(df):
@@ -709,14 +691,16 @@ def get_market_structure(df):
 
     if (
         recent_high > previous_high
-        and recent_low > previous_low
+        and
+        recent_low > previous_low
     ):
 
         return "BULLISH"
 
     if (
         recent_high < previous_high
-        and recent_low < previous_low
+        and
+        recent_low < previous_low
     ):
 
         return "BEARISH"
@@ -725,10 +709,13 @@ def get_market_structure(df):
 
 
 # ============================================================
-# EMA SLOPE
+# PERCENTAGE CHANGE
 # ============================================================
 
-def percentage_change(old_value, new_value):
+def percentage_change(
+    old_value,
+    new_value
+):
 
     if old_value == 0:
 
@@ -742,17 +729,6 @@ def percentage_change(old_value, new_value):
 
 # ============================================================
 # DETERMINE MARKET CONDITION
-#
-# IMPORTANT:
-# We deliberately do NOT use ADX or volume.
-#
-# A market is considered directional when:
-#
-# 1. EMA50 has directional slope
-# 2. EMA20 has directional slope
-# 3. EMA relationship agrees with the direction
-#
-# Structure is then used as an additional condition.
 # ============================================================
 
 def get_market_condition(
@@ -840,8 +816,6 @@ def get_market_condition(
 
 # ============================================================
 # ANALYZE SYMBOL
-#
-# Called every time a forming candle update arrives.
 # ============================================================
 
 def analyze_symbol(symbol):
@@ -999,10 +973,6 @@ def analyze_symbol(symbol):
 
     # --------------------------------------------------------
     # IMPENDING GOLDEN CROSS
-    #
-    # EMA20 below EMA50
-    # EMA20 close to EMA50
-    # EMA20 moving upward
     # --------------------------------------------------------
 
     impending_golden = (
@@ -1018,10 +988,6 @@ def analyze_symbol(symbol):
 
     # --------------------------------------------------------
     # IMPENDING DEATH CROSS
-    #
-    # EMA20 above EMA50
-    # EMA20 close to EMA50
-    # EMA20 moving downward
     # --------------------------------------------------------
 
     impending_death = (
@@ -1061,10 +1027,6 @@ def analyze_symbol(symbol):
 
     # --------------------------------------------------------
     # TREND VALIDATION
-    #
-    # We want actual directional markets only.
-    #
-    # Sideways markets are rejected.
     # --------------------------------------------------------
 
     bullish_trending_market = (
@@ -1091,9 +1053,6 @@ def analyze_symbol(symbol):
 
     # --------------------------------------------------------
     # SELECT SIGNAL
-    #
-    # IMPORTANT:
-    # Only signals from trending markets are allowed.
     # --------------------------------------------------------
 
     signal = None
@@ -1142,8 +1101,6 @@ def analyze_symbol(symbol):
 
     # --------------------------------------------------------
     # CANDLE STATUS
-    #
-    # Bitget WebSocket is updating the current candle.
     # --------------------------------------------------------
 
     interval_ms = (
@@ -1168,7 +1125,7 @@ def analyze_symbol(symbol):
         candle_status = "CLOSED"
 
     # --------------------------------------------------------
-    # WE ONLY WANT DEVELOPING / FORMING CANDLES
+    # FORMING CANDLE ONLY
     # --------------------------------------------------------
 
     if candle_status != "FORMING":
@@ -1180,10 +1137,6 @@ def analyze_symbol(symbol):
         tz=timezone.utc
     )
 
-    # --------------------------------------------------------
-    # TREND LABEL
-    # --------------------------------------------------------
-
     if direction == "BULLISH":
 
         trend_label = "BULLISH TREND"
@@ -1192,21 +1145,13 @@ def analyze_symbol(symbol):
 
         trend_label = "BEARISH TREND"
 
-    # --------------------------------------------------------
-    # MARKET CONDITION
-    # --------------------------------------------------------
-
     if trending:
 
-        market_status = (
-            market_condition
-        )
+        market_status = market_condition
 
     else:
 
-        market_status = (
-            "SIDEWAYS / RANGE"
-        )
+        market_status = "SIDEWAYS / RANGE"
 
     return {
         "symbol": symbol,
@@ -1217,9 +1162,10 @@ def analyze_symbol(symbol):
 
         "status": candle_status,
 
-        "candle_time": candle_time.strftime(
-            "%Y-%m-%d %H:%M UTC"
-        ),
+        "candle_time":
+            candle_time.strftime(
+                "%Y-%m-%d %H:%M UTC"
+            ),
 
         "price": current_price,
 
@@ -1227,41 +1173,28 @@ def analyze_symbol(symbol):
 
         "ema50": current_ema50,
 
-        "ema_distance": (
-            ema_distance_percent
-        ),
+        "ema_distance":
+            ema_distance_percent,
 
-        "ema20_slope": (
-            condition_ema20_slope
-        ),
+        "ema20_slope":
+            condition_ema20_slope,
 
-        "ema50_slope": (
-            condition_ema50_slope
-        ),
+        "ema50_slope":
+            condition_ema50_slope,
 
-        "market_condition": (
-            market_status
-        ),
+        "market_condition":
+            market_status,
 
-        "trend": trend_label,
+        "trend":
+            trend_label,
 
-        "structure": structure
+        "structure":
+            structure
     }
 
 
 # ============================================================
 # WEBSOCKET CANDLE HANDLER
-#
-# THIS IS THE MOST IMPORTANT PART OF THE NEW VERSION.
-#
-# We count the WebSocket message BEFORE checking whether
-# historical EMA data exists.
-#
-# Therefore:
-#
-# WS DATA RECEIVED > 0
-#
-# genuinely proves data is arriving.
 # ============================================================
 
 def handle_candle_message(message):
@@ -1270,207 +1203,211 @@ def handle_candle_message(message):
     global ws_data_messages
     global ws_candle_messages
 
+    if not message:
+
+        return
+
+    if message == "pong":
+
+        return
+
     try:
 
-        if not message:
+        data = json.loads(
+            message
+        )
 
-            return
+    except (
+        json.JSONDecodeError,
+        TypeError
+    ):
 
-        # ----------------------------------------------------
-        # Bitget heartbeat
-        # ----------------------------------------------------
+        return
 
-        if message == "pong":
+    # --------------------------------------------------------
+    # Count every JSON WebSocket message.
+    # --------------------------------------------------------
 
-            return
+    with ws_lock:
 
-        # ----------------------------------------------------
-        # Parse JSON
-        # ----------------------------------------------------
+        ws_data_messages += 1
+
+    # --------------------------------------------------------
+    # Bitget event messages
+    # --------------------------------------------------------
+
+    event = data.get(
+        "event"
+    )
+
+    if event:
+
+        if event == "subscribe":
+
+            with ws_lock:
+
+                ws_subscriptions += 1
+
+        elif event == "error":
+
+            print(
+                "WEBSOCKET SUBSCRIPTION ERROR:",
+                data
+            )
+
+        return
+
+    arg = data.get(
+        "arg",
+        {}
+    )
+
+    channel = arg.get(
+        "channel",
+        ""
+    )
+
+    symbol = arg.get(
+        "instId",
+        ""
+    )
+
+    if not symbol:
+
+        return
+
+    if channel != "candle30m":
+
+        return
+
+    candle_data = data.get(
+        "data"
+    )
+
+    if not candle_data:
+
+        return
+
+    with ws_lock:
+
+        ws_candle_messages += 1
+
+        ws_updates += len(
+            candle_data
+        )
+
+    for row in candle_data:
+
+        if len(row) < 7:
+
+            continue
 
         try:
 
-            data = json.loads(
-                message
-            )
+            candle = {
+                "ts": int(row[0]),
 
-        except json.JSONDecodeError:
+                "open": float(row[1]),
 
-            return
+                "high": float(row[2]),
 
-        # ----------------------------------------------------
-        # Count every valid WebSocket JSON message.
-        # ----------------------------------------------------
+                "low": float(row[3]),
 
-        with ws_lock:
+                "close": float(row[4]),
 
-            ws_data_messages += 1
+                "volume": float(row[5]),
 
-        # ----------------------------------------------------
-        # Ignore non-data messages.
-        # ----------------------------------------------------
+                "quote_volume": float(row[6])
+            }
 
-        if data.get("event"):
+        except (
+            ValueError,
+            TypeError
+        ):
 
-            return
-
-        arg = data.get(
-            "arg",
-            {}
-        )
-
-        channel = arg.get(
-            "channel",
-            ""
-        )
-
-        symbol = arg.get(
-            "instId",
-            ""
-        )
-
-        if not symbol:
-
-            return
+            continue
 
         # ----------------------------------------------------
-        # We only process 30-minute candles.
+        # UPDATE SHARED CANDLE
         # ----------------------------------------------------
 
-        if channel != "candle30m":
+        with candles_lock:
 
-            return
+            if symbol not in candles:
 
-        candle_data = data.get(
-            "data"
-        )
+                candles[symbol] = deque(
+                    maxlen=CANDLE_LIMIT
+                )
 
-        if not candle_data:
+            history = candles[
+                symbol
+            ]
 
-            return
+            replaced = False
 
-        with ws_lock:
-
-            ws_candle_messages += 1
-
-            ws_updates += 1
-
-        # ----------------------------------------------------
-        # Bitget candle format:
-        #
-        # [timestamp, open, high, low, close,
-        #  baseVolume, quoteVolume]
-        # ----------------------------------------------------
-
-        for row in candle_data:
-
-            if len(row) < 7:
-
-                continue
-
-            try:
-
-                candle = {
-                    "ts": int(row[0]),
-
-                    "open": float(row[1]),
-
-                    "high": float(row[2]),
-
-                    "low": float(row[3]),
-
-                    "close": float(row[4]),
-
-                    "volume": float(row[5]),
-
-                    "quote_volume": float(row[6])
-                }
-
-            except (
-                ValueError,
-                TypeError
+            for index in range(
+                len(history) - 1,
+                -1,
+                -1
             ):
 
-                continue
-
-            # ------------------------------------------------
-            # Store/update the current candle.
-            # ------------------------------------------------
-
-            with candles_lock:
-
-                if symbol not in candles:
-
-                    candles[symbol] = deque(
-                        maxlen=CANDLE_LIMIT
-                    )
-
-                history = candles[
-                    symbol
+                existing = history[
+                    index
                 ]
 
-                replaced = False
+                if int(
+                    existing["ts"]
+                ) == candle["ts"]:
 
-                for index in range(
-                    len(history) - 1,
-                    -1,
-                    -1
-                ):
+                    history[index] = candle
 
-                    existing = history[
-                        index
-                    ]
+                    replaced = True
 
-                    if int(
-                        existing["ts"]
-                    ) == candle["ts"]:
+                    break
 
-                        history[index] = (
-                            candle
-                        )
+            if not replaced:
 
-                        replaced = True
-
-                        break
-
-                if not replaced:
-
-                    history.append(
-                        candle
-                    )
-
-            # ------------------------------------------------
-            # Diagnostic output
-            #
-            # Only print occasional live data so GitHub logs
-            # don't become enormous.
-            # ------------------------------------------------
-
-            if (
-                ws_updates <= 20
-                or ws_updates % 100 == 0
-            ):
-
-                print(
-                    f"WS DATA RECEIVED | "
-                    f"{symbol} | "
-                    f"candle30m | "
-                    f"price={candle['close']:.8g}"
+                history.append(
+                    candle
                 )
 
-            # ------------------------------------------------
-            # Process EMA signal immediately.
-            # ------------------------------------------------
+        # ----------------------------------------------------
+        # DIAGNOSTIC
+        # ----------------------------------------------------
 
-            result = analyze_symbol(
-                symbol
+        current_update_count = 0
+
+        with ws_lock:
+
+            current_update_count = (
+                ws_updates
             )
 
-            if result:
+        if (
+            current_update_count <= 20
+            or current_update_count % 100 == 0
+        ):
 
-                send_signal_if_new(
-                    result
-                )
+            print(
+                f"WS DATA RECEIVED | "
+                f"{symbol} | "
+                f"candle30m | "
+                f"price={candle['close']:.8g}"
+            )
+
+        # ----------------------------------------------------
+        # ANALYZE IMMEDIATELY
+        # ----------------------------------------------------
+
+        result = analyze_symbol(
+            symbol
+        )
+
+        if result:
+
+            send_signal_if_new(
+                result
+            )
 
 
 # ============================================================
@@ -1491,14 +1428,6 @@ def send_signal_if_new(result):
         "candle_time"
     ]
 
-    # --------------------------------------------------------
-    # State includes candle timestamp/status.
-    #
-    # This allows another signal on a later developing
-    # candle while preventing duplicate spam on the same
-    # candle.
-    # --------------------------------------------------------
-
     state_key = (
         signal
         + "|"
@@ -1517,7 +1446,6 @@ def send_signal_if_new(result):
 
             return
 
-        # Reserve before Telegram request.
         last_alert_state[
             symbol
         ] = state_key
@@ -1669,7 +1597,7 @@ def format_message(signal):
         f"{signal['ema50_slope']:.4f}%\n\n"
 
         f"FORMING CANDLE\n"
-        f"REAL-TIME / DEVELOPING\n"
+        f"REAL-TIME / DEVELOPING"
     )
 
     return message
@@ -1697,10 +1625,6 @@ def websocket_worker(
                 f"CONNECTING | "
                 f"{len(symbols)} pairs"
             )
-
-            # ------------------------------------------------
-            # Create WebSocket connection.
-            # ------------------------------------------------
 
             ws = websocket.WebSocketApp(
                 BITGET_WS_URL,
@@ -1738,12 +1662,6 @@ def websocket_worker(
                         close_msg
                     )
             )
-
-            # ------------------------------------------------
-            # Run connection.
-            #
-            # ping_interval sends WebSocket ping frames.
-            # ------------------------------------------------
 
             ws.run_forever(
                 ping_interval=WS_PING_INTERVAL,
@@ -1807,28 +1725,36 @@ def websocket_on_open(
             "instId": symbol
         })
 
-    # --------------------------------------------------------
-    # Bitget subscription request.
-    # --------------------------------------------------------
-
     request = {
         "op": "subscribe",
         "args": subscriptions
     }
 
-    ws.send(
-        json.dumps(request)
-    )
+    try:
 
-    with ws_lock:
+        ws.send(
+            json.dumps(
+                request
+            )
+        )
 
-        ws_connections_live += 1
+        with ws_lock:
 
-    print(
-        f"WS {connection_number}: "
-        f"SUBSCRIPTION REQUEST SENT | "
-        f"{len(symbols)} pairs"
-    )
+            ws_connections_live += 1
+
+        print(
+            f"WS {connection_number}: "
+            f"SUBSCRIPTION REQUEST SENT | "
+            f"{len(symbols)} pairs"
+        )
+
+    except Exception as error:
+
+        print(
+            f"WS {connection_number}: "
+            f"SUBSCRIBE ERROR | "
+            f"{error}"
+        )
 
 
 # ============================================================
@@ -1841,25 +1767,19 @@ def websocket_on_message(
     message
 ):
 
-    # --------------------------------------------------------
-    # Handle heartbeat.
-    # --------------------------------------------------------
-
     if message == "ping":
 
         try:
 
-            ws.send("pong")
+            ws.send(
+                "pong"
+            )
 
         except Exception:
 
             pass
 
         return
-
-    # --------------------------------------------------------
-    # Count/handle candle data.
-    # --------------------------------------------------------
 
     handle_candle_message(
         message
@@ -1911,7 +1831,9 @@ def start_websocket_connections(
 
     print()
     print("=" * 70)
-    print("STARTING BITGET WEBSOCKET CONNECTIONS")
+    print(
+        "STARTING BITGET WEBSOCKET CONNECTIONS"
+    )
     print("=" * 70)
 
     chunks = [
@@ -1963,10 +1885,9 @@ def start_websocket_connections(
             thread
         )
 
-        # Small stagger prevents all connections
-        # from hitting Bitget simultaneously.
-
-        time.sleep(0.15)
+        time.sleep(
+            0.15
+        )
 
     return threads
 
@@ -1981,7 +1902,9 @@ def websocket_status_loop():
 
     while True:
 
-        time.sleep(30)
+        time.sleep(
+            30
+        )
 
         with ws_lock:
 
@@ -2017,6 +1940,7 @@ def websocket_status_loop():
         )
 
         print()
+
         print(
             f"{timestamp} | "
             f"WebSocket status:"
@@ -2071,11 +1995,14 @@ def websocket_status_loop():
 def main():
 
     print()
+
     print("=" * 70)
+
     print(
         "BITGET EMA20 / EMA50 REAL-TIME "
         "WEBSOCKET SCANNER"
     )
+
     print("=" * 70)
 
     print(
@@ -2152,6 +2079,7 @@ def main():
     )
 
     print("=" * 70)
+
     print()
 
     # --------------------------------------------------------
@@ -2167,10 +2095,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # INITIALIZE HISTORICAL DATA
-    #
-    # This gives every pair enough candles to calculate
-    # EMA20 and EMA50 before live updates arrive.
+    # INITIALIZE HISTORY
     # --------------------------------------------------------
 
     initialize_history(
@@ -2197,13 +2122,15 @@ def main():
     diagnostic_thread.start()
 
     # --------------------------------------------------------
-    # WAIT FOR WEBSOCKETS
+    # SCANNER STATUS
     # --------------------------------------------------------
 
     print()
+
     print("=" * 70)
+
     print(
-        "WEBSOCKET SCANNER IS NOW STARTING"
+        "WEBSOCKET SCANNER IS NOW LIVE"
     )
 
     print(
@@ -2225,6 +2152,7 @@ def main():
     )
 
     print("=" * 70)
+
     print()
 
     # --------------------------------------------------------
@@ -2233,7 +2161,9 @@ def main():
 
     while True:
 
-        time.sleep(60)
+        time.sleep(
+            60
+        )
 
 
 # ============================================================
@@ -2257,7 +2187,5 @@ if __name__ == "__main__":
         print(
             f"MAIN ERROR: {error}"
         )
-
-        # Give GitHub Actions a clear failure code.
 
         raise
