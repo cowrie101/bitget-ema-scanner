@@ -2137,14 +2137,11 @@ def main():
         f"Pairs: {len(symbols)}"
     )
 
-    print(
-        f"WebSocket connections: "
-        f"{(
-            len(symbols)
-            + WS_PAIRS_PER_CONNECTION
-            - 1
-        ) // WS_PAIRS_PER_CONNECTION}"
-    )
+    prprint(
+    "WebSocket connections:",
+    (len(symbols) + WS_PAIRS_PER_CONNECTION - 1)
+    // WS_PAIRS_PER_CONNECTION
+)
 
     print(
         "Waiting for FORMING 30-minute "
