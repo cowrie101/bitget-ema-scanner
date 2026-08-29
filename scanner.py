@@ -1,29 +1,47 @@
+import json
+import math
 import os
-import time
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
-import pandas as pd
+import websocket
 
 
 # ============================================================
-# BITGET EMA / ADX / MARKET STRUCTURE / VOLUME SCANNER
+# BITGET EMA 20 / EMA 50 REAL-TIME SCANNER
 #
-# FAST CONCURRENT VERSION
+# 30-MINUTE FORMING CANDLE
+#
+# ADX       = OFF
+# VOLUME    = OFF
+# STRUCTURE = OFF
+#
+# MARKET CONDITION = ON
+# SIDEWAYS SIGNALS  = OFF
 # ============================================================
 
-BITGET_SYMBOLS = (
+
+# ============================================================
+# BITGET API
+# ============================================================
+
+SYMBOLS_URL = (
     "https://api.bitget.com/api/v2/spot/public/symbols"
 )
 
-BITGET_CANDLES = (
+HISTORY_URL = (
     "https://api.bitget.com/api/v2/spot/market/history-candles"
 )
 
-TELEGRAM_SEND = (
+WS_URL = (
+    "wss://ws.bitget.com/v2/ws/public"
+)
+
+TELEGRAM_URL = (
     "https://api.telegram.org/bot{}/sendMessage"
 )
 
@@ -32,133 +50,126 @@ TELEGRAM_SEND = (
 # SETTINGS
 # ============================================================
 
+TIMEFRAME = "30min"
+
+WS_CHANNEL = "candle30m"
+
 EMA_FAST = 20
+
 EMA_SLOW = 50
 
-GRANULARITY = "30min"
+HISTORY_LIMIT = 100
 
-CANDLE_LIMIT = 200
+MAX_CANDLES = 100
 
-# ------------------------------------------------------------
-# SCAN INTERVAL
+
+# ============================================================
+# IMPENDING CROSS SETTINGS
 #
-# The scanner attempts to begin another scan every 30 seconds.
+# Example:
 #
-# IMPORTANT:
-# If a full market scan takes longer than 30 seconds,
-# the next scan starts immediately after the current scan.
-# It will NEVER create overlapping scans.
-# ------------------------------------------------------------
+# 0.10 means EMA20 must be within 0.10%
+# of EMA50 to be considered close to crossing.
+# ============================================================
 
-SCAN_INTERVAL = 30
+IMPENDING_CROSS_PERCENT = 0.10
 
-# ------------------------------------------------------------
-# CONCURRENT WORKERS
+
+# ============================================================
+# MARKET CONDITION
 #
-# Bitget documents the public candle endpoint at 20 requests/sec.
-# We deliberately stay below that.
-# ------------------------------------------------------------
+# We determine trend using:
+#
+# 1. EMA50 slope
+# 2. EMA20 slope
+# 3. Price position relative to EMA50
+#
+# This avoids using ADX, volume or structure.
+# ============================================================
 
-MAX_WORKERS = 12
+TREND_LOOKBACK = 3
 
-# Maximum candle-request starts per rolling second.
-REQUESTS_PER_SECOND = 19
-
-# HTTP timeout for individual requests.
-REQUEST_TIMEOUT = 10
-
-# Retry count for temporary API/network problems.
-MAX_RETRIES = 3
+MIN_TREND_SLOPE_PERCENT = 0.02
 
 
 # ============================================================
-# IMPENDING CROSS
+# WEBSOCKET
 # ============================================================
 
-IMPENDING_CROSS_PERCENT = 0.15
+CHANNELS_PER_WS = 40
 
+RECONNECT_DELAY = 5
 
-# ============================================================
-# ADX SETTINGS
-# ============================================================
-
-ADX_PERIOD = 14
+PING_SECONDS = 25
 
 
 # ============================================================
-# VOLUME SETTINGS
+# REST HISTORY LOADING
 # ============================================================
 
-VOLUME_LOOKBACK = 20
+HISTORY_WORKERS = 12
 
+REST_REQUESTS_PER_SECOND = 18
 
-# ============================================================
-# MARKET STRUCTURE SETTINGS
-# ============================================================
-
-STRUCTURE_LOOKBACK = 5
+REQUEST_TIMEOUT = 15
 
 
 # ============================================================
-# TELEGRAM SECRETS
+# TELEGRAM
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.environ.get(
+TELEGRAM_BOT_TOKEN = os.getenv(
     "TELEGRAM_BOT_TOKEN"
 )
 
-TELEGRAM_CHAT_ID = os.environ.get(
+TELEGRAM_CHAT_ID = os.getenv(
     "TELEGRAM_CHAT_ID"
 )
 
 
 # ============================================================
-# MAIN SESSION
+# GLOBAL STATE
 # ============================================================
 
-session = requests.Session()
+candles = {}
 
-session.headers.update({
-    "User-Agent": "Bitget-EMA-ADX-Scanner/4.0"
-})
+lock = threading.RLock()
+
+stop_event = threading.Event()
+
+telegram_lock = threading.Lock()
 
 
-# ============================================================
-# THREAD-LOCAL HTTP SESSIONS
+# ------------------------------------------------------------
+# Prevent repeated alerts for the same candle/setup.
+# ------------------------------------------------------------
+
+last_alert = {}
+
+
+# ------------------------------------------------------------
+# Current signal state.
 #
-# Each worker gets its own requests.Session.
-# This avoids sharing one Session object between threads.
-# ============================================================
-
-thread_local = threading.local()
-
-
-def get_thread_session():
-
-    if not hasattr(
-        thread_local,
-        "session"
-    ):
-
-        thread_local.session = requests.Session()
-
-        thread_local.session.headers.update({
-            "User-Agent": "Bitget-EMA-ADX-Scanner/4.0"
-        })
-
-    return thread_local.session
-
-
-# ============================================================
-# REQUEST RATE LIMITER
+# This is deliberately separate from last_alert because
+# the EMA relationship can move:
 #
-# Keeps candle requests below Bitget's documented
-# public endpoint rate limit.
-# ============================================================
+# IMPENDING -> CROSS
+#
+# or:
+#
+# IMPENDING -> disappears
+# ------------------------------------------------------------
 
-rate_lock = threading.Lock()
+signal_state = {}
+
+
+# ============================================================
+# RATE LIMITER
+# ============================================================
 
 request_times = deque()
+
+rate_lock = threading.Lock()
 
 
 def wait_for_request_slot():
@@ -169,7 +180,6 @@ def wait_for_request_slot():
 
         with rate_lock:
 
-            # Remove requests older than one second.
             while (
                 request_times
                 and now - request_times[0] >= 1.0
@@ -177,7 +187,7 @@ def wait_for_request_slot():
 
                 request_times.popleft()
 
-            if len(request_times) < REQUESTS_PER_SECOND:
+            if len(request_times) < REST_REQUESTS_PER_SECOND:
 
                 request_times.append(now)
 
@@ -185,34 +195,49 @@ def wait_for_request_slot():
 
             wait_time = (
                 1.0
-                - (now - request_times[0])
-                + 0.005
+                - (
+                    now
+                    - request_times[0]
+                )
+                + 0.01
             )
 
-        if wait_time > 0:
-
-            time.sleep(wait_time)
-
-
-# ============================================================
-# MEMORY
-#
-# Prevents duplicate alerts.
-# ============================================================
-
-last_alert_state = {}
-
-alert_lock = threading.Lock()
+        time.sleep(
+            max(0.01, wait_time)
+        )
 
 
 # ============================================================
-# GET ALL ONLINE USDT SPOT PAIRS
+# TIME
+# ============================================================
+
+def now_utc():
+
+    return datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+
+def candle_time_text(timestamp):
+
+    return datetime.fromtimestamp(
+        timestamp / 1000,
+        tz=timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+
+# ============================================================
+# BITGET SYMBOLS
 # ============================================================
 
 def get_symbols():
 
-    response = session.get(
-        BITGET_SYMBOLS,
+    response = requests.get(
+        SYMBOLS_URL,
         timeout=REQUEST_TIMEOUT
     )
 
@@ -228,7 +253,10 @@ def get_symbols():
 
     symbols = []
 
-    for item in data.get("data", []):
+    for item in data.get(
+        "data",
+        []
+    ):
 
         symbol = item.get(
             "symbol",
@@ -251,44 +279,35 @@ def get_symbols():
             and symbol.endswith("USDT")
         ):
 
-            symbols.append(symbol)
+            symbols.append(
+                symbol
+            )
 
-    return sorted(set(symbols))
-
-
-# ============================================================
-# GET 30-MINUTE CANDLES
-# ============================================================
-
-def get_candles(symbol):
-
-    end_time = int(
-        time.time() * 1000
+    return sorted(
+        set(symbols)
     )
+
+
+# ============================================================
+# HISTORICAL CANDLES
+# ============================================================
+
+def get_history(symbol):
 
     params = {
         "symbol": symbol,
-        "granularity": GRANULARITY,
-        "endTime": str(end_time),
-        "limit": str(CANDLE_LIMIT)
+        "granularity": TIMEFRAME,
+        "limit": str(HISTORY_LIMIT)
     }
 
-    worker_session = get_thread_session()
-
-    for attempt in range(
-        MAX_RETRIES
-    ):
+    for attempt in range(3):
 
         try:
 
-            # ------------------------------------------------
-            # Rate-limit every request attempt.
-            # ------------------------------------------------
-
             wait_for_request_slot()
 
-            response = worker_session.get(
-                BITGET_CANDLES,
+            response = requests.get(
+                HISTORY_URL,
                 params=params,
                 timeout=REQUEST_TIMEOUT
             )
@@ -301,19 +320,18 @@ def get_candles(symbol):
                 504
             ):
 
-                if attempt < MAX_RETRIES - 1:
+                time.sleep(
+                    1.0 + attempt
+                )
 
-                    time.sleep(
-                        0.5 * (attempt + 1)
-                    )
-
-                    continue
-
-                return None
+                continue
 
             if response.status_code == 400:
 
-                return None
+                return (
+                    symbol,
+                    None
+                )
 
             response.raise_for_status()
 
@@ -321,426 +339,476 @@ def get_candles(symbol):
 
             if data.get("code") != "00000":
 
-                return None
+                return (
+                    symbol,
+                    None
+                )
 
-            rows = data.get(
+            result = []
+
+            for row in data.get(
                 "data",
                 []
+            ):
+
+                if len(row) < 5:
+
+                    continue
+
+                try:
+
+                    result.append({
+                        "ts": int(row[0]),
+                        "open": float(row[1]),
+                        "high": float(row[2]),
+                        "low": float(row[3]),
+                        "close": float(row[4]),
+                    })
+
+                except (
+                    TypeError,
+                    ValueError
+                ):
+
+                    continue
+
+            result.sort(
+                key=lambda x: x["ts"]
             )
 
-            if len(rows) < EMA_SLOW + 10:
+            minimum = (
+                EMA_SLOW
+                + TREND_LOOKBACK
+                + 5
+            )
 
-                return None
+            if len(result) < minimum:
 
-            return rows
+                return (
+                    symbol,
+                    None
+                )
 
-        except (
-            requests.RequestException,
-            ValueError
-        ) as error:
+            return (
+                symbol,
+                result[-MAX_CANDLES:]
+            )
 
-            if attempt == MAX_RETRIES - 1:
+        except requests.RequestException as error:
+
+            if attempt == 2:
 
                 print(
-                    f"{symbol}: request failed: "
+                    f"{symbol}: "
+                    f"history failed: "
                     f"{error}"
                 )
 
-                return None
+                return (
+                    symbol,
+                    None
+                )
 
             time.sleep(
-                0.5 * (attempt + 1)
+                1.0 + attempt
             )
-
-    return None
-
-
-# ============================================================
-# CREATE DATAFRAME
-# ============================================================
-
-def make_dataframe(rows):
-
-    cleaned_rows = []
-
-    for row in rows:
-
-        if len(row) >= 7:
-
-            cleaned_rows.append(
-                row[:7]
-            )
-
-    if not cleaned_rows:
-
-        return pd.DataFrame()
-
-    cleaned_rows = sorted(
-        cleaned_rows,
-        key=lambda x: int(x[0])
-    )
-
-    df = pd.DataFrame(
-        cleaned_rows,
-        columns=[
-            "ts",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "quote_volume"
-        ]
-    )
-
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume"
-    ]
-
-    for column in numeric_columns:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    df["ts"] = pd.to_numeric(
-        df["ts"],
-        errors="coerce"
-    )
-
-    df = df.dropna(
-        subset=[
-            "ts",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-    )
-
-    return df
-
-
-# ============================================================
-# CALCULATE ADX
-# ============================================================
-
-def calculate_adx(
-    df,
-    period=14
-):
-
-    high = df["high"]
-
-    low = df["low"]
-
-    close = df["close"]
-
-    previous_close = close.shift(1)
-
-    tr1 = high - low
-
-    tr2 = (
-        high - previous_close
-    ).abs()
-
-    tr3 = (
-        low - previous_close
-    ).abs()
-
-    true_range = pd.concat(
-        [
-            tr1,
-            tr2,
-            tr3
-        ],
-        axis=1
-    ).max(axis=1)
-
-    up_move = (
-        high - high.shift(1)
-    )
-
-    down_move = (
-        low.shift(1) - low
-    )
-
-    plus_dm = up_move.where(
-        (up_move > down_move)
-        & (up_move > 0),
-        0.0
-    )
-
-    minus_dm = down_move.where(
-        (down_move > up_move)
-        & (down_move > 0),
-        0.0
-    )
-
-    atr = true_range.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
-
-    plus_di = (
-        100
-        * plus_dm.ewm(
-            alpha=1 / period,
-            adjust=False
-        ).mean()
-        / atr
-    )
-
-    minus_di = (
-        100
-        * minus_dm.ewm(
-            alpha=1 / period,
-            adjust=False
-        ).mean()
-        / atr
-    )
-
-    denominator = (
-        plus_di + minus_di
-    )
-
-    dx = (
-        100
-        * (plus_di - minus_di).abs()
-        / denominator
-    )
-
-    adx = dx.ewm(
-        alpha=1 / period,
-        adjust=False
-    ).mean()
 
     return (
-        pd.to_numeric(
-            adx,
-            errors="coerce"
-        ).fillna(0),
-
-        pd.to_numeric(
-            plus_di,
-            errors="coerce"
-        ).fillna(0),
-
-        pd.to_numeric(
-            minus_di,
-            errors="coerce"
-        ).fillna(0)
+        symbol,
+        None
     )
 
 
 # ============================================================
-# MARKET STRUCTURE
+# LOAD HISTORY
 # ============================================================
 
-def get_market_structure(df):
+def load_history(symbols):
 
-    lookback = STRUCTURE_LOOKBACK
+    print(
+        f"Loading historical candles "
+        f"for {len(symbols)} pairs..."
+    )
 
-    if len(df) < (
-        lookback * 2 + 2
+    good = 0
+
+    failed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=HISTORY_WORKERS
+    ) as executor:
+
+        futures = {
+            executor.submit(
+                get_history,
+                symbol
+            ): symbol
+            for symbol in symbols
+        }
+
+        for number, future in enumerate(
+            as_completed(futures),
+            1
+        ):
+
+            symbol = futures[
+                future
+            ]
+
+            try:
+
+                returned_symbol, data = (
+                    future.result()
+                )
+
+            except Exception as error:
+
+                failed += 1
+
+                print(
+                    f"{symbol}: "
+                    f"history worker error: "
+                    f"{error}"
+                )
+
+                continue
+
+            if data:
+
+                with lock:
+
+                    candles[
+                        returned_symbol
+                    ] = deque(
+                        data,
+                        maxlen=MAX_CANDLES
+                    )
+
+                good += 1
+
+            else:
+
+                failed += 1
+
+            if (
+                number % 100 == 0
+                or number == len(symbols)
+            ):
+
+                print(
+                    f"History: "
+                    f"{number}/"
+                    f"{len(symbols)} | "
+                    f"usable: {good} | "
+                    f"failed: {failed}"
+                )
+
+    print()
+
+    print(
+        f"History ready: "
+        f"{good}/{len(symbols)} pairs"
+    )
+
+    print()
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def calculate_ema(
+    values,
+    period
+):
+
+    if len(values) < period:
+
+        return None
+
+    multiplier = (
+        2.0
+        / (period + 1)
+    )
+
+    ema = (
+        sum(
+            values[:period]
+        )
+        / period
+    )
+
+    for price in values[period:]:
+
+        ema = (
+            (
+                price - ema
+            )
+            * multiplier
+        ) + ema
+
+    return ema
+
+
+# ============================================================
+# MARKET CONDITION
+#
+# No ADX.
+# No volume.
+# No market structure.
+#
+# We use EMA slopes + price position.
+# ============================================================
+
+def get_market_condition(
+    closes,
+    current_ema20,
+    current_ema50
+):
+
+    required = (
+        EMA_SLOW
+        + TREND_LOOKBACK
+        + 2
+    )
+
+    if len(closes) < required:
+
+        return "SIDEWAYS"
+
+    # --------------------------------------------------------
+    # EMA50 values at previous points.
+    # --------------------------------------------------------
+
+    ema50_values = []
+
+    ema20_values = []
+
+    for end in range(
+        len(closes)
+        - TREND_LOOKBACK
+        - 1,
+        len(closes) + 1
     ):
 
-        return "NEUTRAL"
+        section = closes[:end]
 
-    recent = df.iloc[
-        -lookback:
-    ]
+        value50 = calculate_ema(
+            section,
+            EMA_SLOW
+        )
 
-    previous = df.iloc[
-        -(lookback * 2):-lookback
-    ]
+        value20 = calculate_ema(
+            section,
+            EMA_FAST
+        )
 
-    recent_high = (
-        recent["high"].max()
-    )
+        if (
+            value50 is not None
+            and value20 is not None
+        ):
 
-    previous_high = (
-        previous["high"].max()
-    )
+            ema50_values.append(
+                value50
+            )
 
-    recent_low = (
-        recent["low"].min()
-    )
+            ema20_values.append(
+                value20
+            )
 
-    previous_low = (
-        previous["low"].min()
-    )
+    if len(ema50_values) < 2:
+
+        return "SIDEWAYS"
+
+    old_ema50 = ema50_values[0]
+
+    old_ema20 = ema20_values[0]
+
+    if old_ema50 == 0 or old_ema20 == 0:
+
+        return "SIDEWAYS"
+
+    ema50_slope = (
+        (
+            current_ema50
+            - old_ema50
+        )
+        / old_ema50
+    ) * 100
+
+    ema20_slope = (
+        (
+            current_ema20
+            - old_ema20
+        )
+        / old_ema20
+    ) * 100
+
+    current_price = closes[-1]
+
+    # --------------------------------------------------------
+    # BULLISH TREND
+    # --------------------------------------------------------
 
     if (
-        recent_high > previous_high
-        and recent_low > previous_low
+        ema50_slope
+        >= MIN_TREND_SLOPE_PERCENT
+        and ema20_slope
+        > 0
+        and current_price
+        > current_ema50
     ):
 
-        return "BULLISH"
+        return "TRENDING UP"
+
+    # --------------------------------------------------------
+    # BEARISH TREND
+    # --------------------------------------------------------
 
     if (
-        recent_high < previous_high
-        and recent_low < previous_low
+        ema50_slope
+        <= -MIN_TREND_SLOPE_PERCENT
+        and ema20_slope
+        < 0
+        and current_price
+        < current_ema50
     ):
 
-        return "BEARISH"
+        return "TRENDING DOWN"
 
-    return "NEUTRAL"
+    return "SIDEWAYS"
 
 
 # ============================================================
-# VOLUME ANALYSIS
+# ANALYZE CURRENT FORMING CANDLE
 # ============================================================
 
-def get_volume_status(df):
+def analyze_symbol(
+    symbol,
+    candle
+):
 
-    if len(df) < (
-        VOLUME_LOOKBACK + 1
+    with lock:
+
+        history = candles.get(
+            symbol
+        )
+
+        if not history:
+
+            return None
+
+        items = list(history)
+
+    # --------------------------------------------------------
+    # Replace current candle or add new forming candle.
+    # --------------------------------------------------------
+
+    if (
+        items
+        and items[-1]["ts"]
+        == candle["ts"]
     ):
 
-        return "NORMAL", 0.0
+        items[-1] = candle
 
-    current_volume = float(
-        df.iloc[-1]["volume"]
-    )
+    elif (
+        not items
+        or candle["ts"]
+        > items[-1]["ts"]
+    ):
 
-    average_volume = float(
-        df["volume"]
-        .iloc[
-            -VOLUME_LOOKBACK - 1:-1
-        ]
-        .mean()
-    )
-
-    if average_volume <= 0:
-
-        return "NORMAL", 0.0
-
-    ratio = (
-        current_volume
-        / average_volume
-    )
-
-    if ratio >= 1.5:
-
-        status = "HIGH"
-
-    elif ratio >= 1.15:
-
-        status = "ABOVE AVERAGE"
-
-    elif ratio <= 0.70:
-
-        status = "LOW"
+        items.append(candle)
 
     else:
 
-        status = "NORMAL"
-
-    return status, ratio
-
-
-# ============================================================
-# CHECK CROSS / IMPENDING CROSS
-# ============================================================
-
-def check_setup(symbol):
-
-    rows = get_candles(
-        symbol
-    )
-
-    if not rows:
-
         return None
 
-    df = make_dataframe(
-        rows
-    )
+    items = items[-MAX_CANDLES:]
 
-    if df.empty:
+    closes = [
+        item["close"]
+        for item in items
+    ]
 
-        return None
-
-    if len(df) < (
-        EMA_SLOW + 20
+    if len(closes) < (
+        EMA_SLOW + 10
     ):
 
         return None
 
     # --------------------------------------------------------
-    # EMA
+    # EMA20 / EMA50
     # --------------------------------------------------------
 
-    df["ema20"] = df[
-        "close"
-    ].ewm(
-        span=EMA_FAST,
-        adjust=False
-    ).mean()
+    current_ema20 = calculate_ema(
+        closes,
+        EMA_FAST
+    )
 
-    df["ema50"] = df[
-        "close"
-    ].ewm(
-        span=EMA_SLOW,
-        adjust=False
-    ).mean()
+    current_ema50 = calculate_ema(
+        closes,
+        EMA_SLOW
+    )
+
+    if (
+        current_ema20 is None
+        or current_ema50 is None
+    ):
+
+        return None
 
     # --------------------------------------------------------
-    # ADX
+    # MARKET CONDITION
     # --------------------------------------------------------
 
-    (
-        df["adx"],
-        df["plus_di"],
-        df["minus_di"]
-    ) = calculate_adx(
-        df,
-        ADX_PERIOD
+    market_condition = get_market_condition(
+        closes,
+        current_ema20,
+        current_ema50
     )
 
-    previous = df.iloc[-2]
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # SIDEWAYS = NO SIGNAL
+    # --------------------------------------------------------
 
-    current = df.iloc[-1]
+    if market_condition == "SIDEWAYS":
 
-    previous_ema20 = float(
-        previous["ema20"]
+        with lock:
+
+            signal_state.pop(
+                symbol,
+                None
+            )
+
+        return None
+
+    # --------------------------------------------------------
+    # PREVIOUS EMA VALUES
+    #
+    # These are calculated using the previous candle.
+    # --------------------------------------------------------
+
+    previous_closes = closes[:-1]
+
+    previous_ema20 = calculate_ema(
+        previous_closes,
+        EMA_FAST
     )
 
-    previous_ema50 = float(
-        previous["ema50"]
+    previous_ema50 = calculate_ema(
+        previous_closes,
+        EMA_SLOW
     )
 
-    current_ema20 = float(
-        current["ema20"]
-    )
+    if (
+        previous_ema20 is None
+        or previous_ema50 is None
+    ):
 
-    current_ema50 = float(
-        current["ema50"]
-    )
-
-    current_price = float(
-        current["close"]
-    )
-
-    current_adx = float(
-        current["adx"]
-    )
-
-    current_plus_di = float(
-        current["plus_di"]
-    )
-
-    current_minus_di = float(
-        current["minus_di"]
-    )
+        return None
 
     # --------------------------------------------------------
     # EMA DISTANCE
@@ -750,7 +818,7 @@ def check_setup(symbol):
 
         return None
 
-    ema_distance_percent = (
+    distance = (
         abs(
             current_ema20
             - current_ema50
@@ -778,29 +846,51 @@ def check_setup(symbol):
 
     # --------------------------------------------------------
     # IMPENDING CROSS
+    #
+    # GOLDEN:
+    # EMA20 is below EMA50 and getting very close.
+    #
+    # DEATH:
+    # EMA20 is above EMA50 and getting very close.
     # --------------------------------------------------------
 
     impending_golden = (
         current_ema20
         < current_ema50
-        and ema_distance_percent
+        and distance
         <= IMPENDING_CROSS_PERCENT
+        and market_condition
+        == "TRENDING UP"
     )
 
     impending_death = (
         current_ema20
         > current_ema50
-        and ema_distance_percent
+        and distance
         <= IMPENDING_CROSS_PERCENT
+        and market_condition
+        == "TRENDING DOWN"
     )
 
-    if golden_cross:
+    # --------------------------------------------------------
+    # ACTUAL CROSS DIRECTION MUST AGREE WITH TREND.
+    # --------------------------------------------------------
+
+    if (
+        golden_cross
+        and market_condition
+        == "TRENDING UP"
+    ):
 
         signal = "GOLDEN CROSS"
 
         direction = "BULLISH"
 
-    elif death_cross:
+    elif (
+        death_cross
+        and market_condition
+        == "TRENDING DOWN"
+    ):
 
         signal = "DEATH CROSS"
 
@@ -820,64 +910,14 @@ def check_setup(symbol):
 
     else:
 
+        with lock:
+
+            signal_state.pop(
+                symbol,
+                None
+            )
+
         return None
-
-    # --------------------------------------------------------
-    # MARKET STRUCTURE
-    # --------------------------------------------------------
-
-    structure = get_market_structure(
-        df
-    )
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
-
-    (
-        volume_status,
-        volume_ratio
-    ) = get_volume_status(
-        df
-    )
-
-    # --------------------------------------------------------
-    # ADX TREND STRENGTH
-    # --------------------------------------------------------
-
-    if current_adx >= 25:
-
-        adx_strength = "STRONG TREND"
-
-    elif current_adx >= 20:
-
-        adx_strength = "DEVELOPING TREND"
-
-    else:
-
-        adx_strength = "WEAK / RANGE"
-
-    # --------------------------------------------------------
-    # DI DIRECTION
-    # --------------------------------------------------------
-
-    if (
-        current_plus_di
-        > current_minus_di
-    ):
-
-        di_direction = "BULLISH"
-
-    elif (
-        current_minus_di
-        > current_plus_di
-    ):
-
-        di_direction = "BEARISH"
-
-    else:
-
-        di_direction = "NEUTRAL"
 
     # --------------------------------------------------------
     # CANDLE STATUS
@@ -892,11 +932,7 @@ def check_setup(symbol):
         // interval_ms
     ) * interval_ms
 
-    candle_timestamp = int(
-        current["ts"]
-    )
-
-    if candle_timestamp >= current_bucket:
+    if candle["ts"] >= current_bucket:
 
         candle_status = "FORMING"
 
@@ -904,84 +940,24 @@ def check_setup(symbol):
 
         candle_status = "CLOSED"
 
-    candle_time = datetime.fromtimestamp(
-        candle_timestamp / 1000,
-        tz=timezone.utc
-    )
-
     # --------------------------------------------------------
-    # CONFLUENCE
+    # RETURN SIGNAL
     # --------------------------------------------------------
-
-    confirmations = 0
-
-    if direction == "BULLISH":
-
-        if structure == "BULLISH":
-
-            confirmations += 1
-
-        if (
-            current_plus_di
-            > current_minus_di
-        ):
-
-            confirmations += 1
-
-    if direction == "BEARISH":
-
-        if structure == "BEARISH":
-
-            confirmations += 1
-
-        if (
-            current_minus_di
-            > current_plus_di
-        ):
-
-            confirmations += 1
-
-    if current_adx >= 20:
-
-        confirmations += 1
-
-    if volume_ratio >= 1.15:
-
-        confirmations += 1
-
-    if confirmations >= 3:
-
-        confluence = "HIGHER CONFLUENCE"
-
-    elif confirmations == 2:
-
-        confluence = "MODERATE CONFLUENCE"
-
-    else:
-
-        confluence = "LOW CONFLUENCE"
 
     return {
         "symbol": symbol,
         "signal": signal,
         "direction": direction,
-        "status": candle_status,
-        "candle_time": candle_time.strftime(
-            "%Y-%m-%d %H:%M UTC"
+        "market_condition": market_condition,
+        "candle_status": candle_status,
+        "candle_time": candle_time_text(
+            candle["ts"]
         ),
-        "price": current_price,
+        "price": candle["close"],
         "ema20": current_ema20,
         "ema50": current_ema50,
-        "ema_distance": ema_distance_percent,
-        "adx": current_adx,
-        "plus_di": current_plus_di,
-        "minus_di": current_minus_di,
-        "adx_strength": adx_strength,
-        "di_direction": di_direction,
-        "structure": structure,
-        "volume_status": volume_status,
-        "volume_ratio": volume_ratio,
-        "confluence": confluence
+        "distance": distance,
+        "timestamp": candle["ts"],
     }
 
 
@@ -991,59 +967,46 @@ def check_setup(symbol):
 
 def send_telegram(message):
 
-    if not TELEGRAM_BOT_TOKEN:
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
 
         print(
-            "ERROR: TELEGRAM_BOT_TOKEN is missing."
+            "Telegram secrets missing."
         )
 
         return False
-
-    if not TELEGRAM_CHAT_ID:
-
-        print(
-            "ERROR: TELEGRAM_CHAT_ID is missing."
-        )
-
-        return False
-
-    url = TELEGRAM_SEND.format(
-        TELEGRAM_BOT_TOKEN
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message
-    }
 
     try:
 
-        response = session.post(
-            url,
-            data=payload,
-            timeout=REQUEST_TIMEOUT
-        )
+        with telegram_lock:
+
+            response = requests.post(
+                TELEGRAM_URL.format(
+                    TELEGRAM_BOT_TOKEN
+                ),
+                data={
+                    "chat_id":
+                        TELEGRAM_CHAT_ID,
+                    "text":
+                        message,
+                },
+                timeout=10
+            )
 
         response.raise_for_status()
 
         result = response.json()
 
-        if not result.get("ok"):
-
-            print(
-                "Telegram error:",
-                result
-            )
-
-            return False
-
-        return True
+        return bool(
+            result.get("ok")
+        )
 
     except requests.RequestException as error:
 
         print(
-            "Telegram error:",
-            error
+            f"Telegram error: {error}"
         )
 
         return False
@@ -1053,9 +1016,11 @@ def send_telegram(message):
 # FORMAT TELEGRAM ALERT
 # ============================================================
 
-def format_message(signal):
+def format_alert(
+    result
+):
 
-    if signal["direction"] == "BULLISH":
+    if result["direction"] == "BULLISH":
 
         emoji = "🟢"
 
@@ -1063,380 +1028,425 @@ def format_message(signal):
 
         emoji = "🔴"
 
-    message = (
-        f"{emoji} {signal['signal']}\n\n"
+    return (
 
-        f"Pair: {signal['symbol']}\n"
-        f"Timeframe: 30 MINUTES\n"
-        f"Candle: {signal['status']}\n"
-        f"Time: {signal['candle_time']}\n\n"
+        f"{emoji} "
+        f"{result['signal']}\n\n"
+
+        f"Pair: "
+        f"{result['symbol']}\n"
+
+        f"Timeframe: "
+        f"30 MINUTES\n"
+
+        f"Candle: "
+        f"{result['candle_status']}\n"
+
+        f"Time: "
+        f"{result['candle_time']}\n\n"
 
         f"PRICE\n"
-        f"{signal['price']:.8g}\n\n"
+        f"{result['price']:.8g}\n\n"
 
         f"EMA\n"
-        f"EMA20: {signal['ema20']:.8g}\n"
-        f"EMA50: {signal['ema50']:.8g}\n"
+        f"EMA20: "
+        f"{result['ema20']:.8g}\n"
+
+        f"EMA50: "
+        f"{result['ema50']:.8g}\n"
+
         f"Distance: "
-        f"{signal['ema_distance']:.4f}%\n\n"
+        f"{result['distance']:.4f}%\n\n"
 
-        f"ADX\n"
-        f"ADX: {signal['adx']:.2f}\n"
-        f"+DI: {signal['plus_di']:.2f}\n"
-        f"-DI: {signal['minus_di']:.2f}\n"
-        f"Trend: {signal['adx_strength']}\n"
-        f"DI Direction: {signal['di_direction']}\n\n"
+        f"MARKET CONDITION\n"
+        f"{result['market_condition']}\n\n"
 
-        f"MARKET STRUCTURE\n"
-        f"{signal['structure']}\n\n"
-
-        f"VOLUME\n"
-        f"Status: {signal['volume_status']}\n"
-        f"Ratio: "
-        f"{signal['volume_ratio']:.2f}x average\n\n"
-
-        f"CONFLUENCE\n"
-        f"{signal['confluence']}\n\n"
+        f"STATUS\n"
+        f"FORMING CANDLE\n\n"
 
         f"Bitget Spot"
     )
 
-    return message
-
 
 # ============================================================
-# PROCESS ONE SYMBOL
-#
-# This wrapper allows ThreadPoolExecutor to process
-# many symbols simultaneously.
+# HANDLE LIVE CANDLE
 # ============================================================
 
-def process_symbol(symbol):
+def handle_candle(
+    symbol,
+    row
+):
+
+    if len(row) < 5:
+
+        return
 
     try:
 
-        result = check_setup(
+        candle = {
+            "ts": int(row[0]),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+        }
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return
+
+    result = analyze_symbol(
+        symbol,
+        candle
+    )
+
+    # --------------------------------------------------------
+    # Always save the newest live candle.
+    # --------------------------------------------------------
+
+    with lock:
+
+        history = candles.get(
             symbol
         )
 
-        return (
-            symbol,
-            result,
-            None
-        )
+        if not history:
 
-    except Exception as error:
+            return
 
-        return (
-            symbol,
-            None,
-            str(error)
-        )
-
-
-# ============================================================
-# SCAN ALL PAIRS CONCURRENTLY
-# ============================================================
-
-def scan_market():
-
-    print("=" * 70)
-
-    print(
-        "BITGET EMA20 / EMA50 + ADX + "
-        "STRUCTURE + VOLUME"
-    )
-
-    print(
-        "FAST CONCURRENT 30-MINUTE "
-        "FORMING-CANDLE SCANNER"
-    )
-
-    print("=" * 70)
-
-    scan_start = time.monotonic()
-
-    stamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
-    print(
-        "Scan started:",
-        stamp
-    )
-
-    # --------------------------------------------------------
-    # GET CURRENT ONLINE SYMBOLS
-    # --------------------------------------------------------
-
-    symbols = get_symbols()
-
-    print(
-        f"Found {len(symbols)} "
-        f"online USDT Spot pairs."
-    )
-
-    print(
-        f"Concurrent workers: "
-        f"{MAX_WORKERS}"
-    )
-
-    print(
-        f"Request limit: "
-        f"{REQUESTS_PER_SECOND}/second"
-    )
-
-    print()
-
-    alerts_sent = 0
-
-    setups_found = 0
-
-    failed = 0
-
-    completed = 0
-
-    # --------------------------------------------------------
-    # CONCURRENT SCANNING
-    # --------------------------------------------------------
-
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                process_symbol,
-                symbol
-            ): symbol
-            for symbol in symbols
-        }
-
-        for future in as_completed(
-            futures
+        if (
+            history[-1]["ts"]
+            == candle["ts"]
         ):
 
-            symbol = futures[
-                future
-            ]
+            history[-1] = candle
 
-            completed += 1
+        elif (
+            candle["ts"]
+            > history[-1]["ts"]
+        ):
 
-            try:
+            history.append(
+                candle
+            )
 
-                (
-                    returned_symbol,
-                    result,
-                    error
-                ) = future.result()
+    if not result:
 
-                if error:
-
-                    failed += 1
-
-                    print(
-                        f"{symbol}: {error}"
-                    )
-
-                    continue
-
-                if result:
-
-                    setups_found += 1
-
-                    print(
-                        f"{result['signal']} | "
-                        f"{result['status']} | "
-                        f"{symbol} | "
-                        f"ADX "
-                        f"{result['adx']:.1f} | "
-                        f"Structure "
-                        f"{result['structure']} | "
-                        f"Volume "
-                        f"{result['volume_status']}"
-                    )
-
-                    # ------------------------------------------------
-                    # ALERT DEDUPLICATION
-                    # ------------------------------------------------
-
-                    state_key = (
-                        result["signal"]
-                        + "|"
-                        + result["status"]
-                    )
-
-                    with alert_lock:
-
-                        previous_state = (
-                            last_alert_state.get(
-                                symbol
-                            )
-                        )
-
-                        should_alert = (
-                            previous_state
-                            != state_key
-                        )
-
-                        if should_alert:
-
-                            # Reserve the state before sending.
-                            #
-                            # This prevents duplicate alerts if
-                            # multiple processing events occur.
-                            last_alert_state[
-                                symbol
-                            ] = state_key
-
-                    if should_alert:
-
-                        message = format_message(
-                            result
-                        )
-
-                        if send_telegram(
-                            message
-                        ):
-
-                            alerts_sent += 1
-
-                            print(
-                                "Telegram alert sent:",
-                                symbol
-                            )
-
-                        else:
-
-                            # If Telegram failed, remove the
-                            # reserved state so the next scan
-                            # can retry the alert.
-                            with alert_lock:
-
-                                last_alert_state.pop(
-                                    symbol,
-                                    None
-                                )
-
-                else:
-
-                    # No active setup.
-                    #
-                    # Clear the previous state so a future
-                    # setup can generate a new alert.
-                    with alert_lock:
-
-                        last_alert_state.pop(
-                            symbol,
-                            None
-                        )
-
-            except Exception as error:
-
-                failed += 1
-
-                print(
-                    f"{symbol}: worker error: "
-                    f"{error}"
-                )
-
-            # ------------------------------------------------
-            # PROGRESS
-            # ------------------------------------------------
-
-            if (
-                completed % 50 == 0
-                or completed == len(symbols)
-            ):
-
-                elapsed = (
-                    time.monotonic()
-                    - scan_start
-                )
-
-                print(
-                    f"Progress: "
-                    f"{completed}/"
-                    f"{len(symbols)} "
-                    f"({elapsed:.1f}s)"
-                )
+        return
 
     # --------------------------------------------------------
-    # SCAN SUMMARY
+    # FORMING CANDLE ONLY
+    #
+    # We do not want delayed closed-candle alerts.
     # --------------------------------------------------------
 
-    elapsed = (
-        time.monotonic()
-        - scan_start
+    if result["candle_status"] != "FORMING":
+
+        return
+
+    # --------------------------------------------------------
+    # ALERT KEY
+    #
+    # Allows:
+    #
+    # IMPENDING GOLDEN
+    # then
+    # GOLDEN CROSS
+    #
+    # during the SAME forming candle.
+    # --------------------------------------------------------
+
+    alert_key = (
+        result["signal"]
+        + "|"
+        + str(result["timestamp"])
     )
 
-    print()
+    with lock:
 
-    print(
-        "-" * 70
-    )
-
-    print(
-        f"Pairs scanned: "
-        f"{completed}/{len(symbols)}"
-    )
-
-    print(
-        f"Setups found: "
-        f"{setups_found}"
-    )
-
-    print(
-        f"Failed requests: "
-        f"{failed}"
-    )
-
-    print(
-        f"Alerts sent: "
-        f"{alerts_sent}"
-    )
-
-    print(
-        f"FULL SCAN TIME: "
-        f"{elapsed:.2f} seconds"
-    )
-
-    if elapsed <= 30:
-
-        print(
-            "STATUS: FAST ENOUGH FOR "
-            "30-SECOND SCANNING"
+        previous_alert = last_alert.get(
+            symbol
         )
 
-    elif elapsed <= 60:
+        if previous_alert == alert_key:
+
+            return
+
+        # Reserve before Telegram.
+        last_alert[
+            symbol
+        ] = alert_key
+
+    # --------------------------------------------------------
+    # SEND
+    # --------------------------------------------------------
+
+    message = format_alert(
+        result
+    )
+
+    if send_telegram(
+        message
+    ):
 
         print(
-            "STATUS: UNDER 1 MINUTE"
+            f"{now_utc()} | "
+            f"{result['signal']} | "
+            f"{symbol} | "
+            f"{result['market_condition']} | "
+            f"EMA20 "
+            f"{result['ema20']:.8g} | "
+            f"EMA50 "
+            f"{result['ema50']:.8g}"
         )
 
     else:
 
-        print(
-            "STATUS: STILL OVER 1 MINUTE"
-        )
+        # Allow retry if Telegram fails.
+        with lock:
 
-    print(
-        "-" * 70
-    )
+            if last_alert.get(
+                symbol
+            ) == alert_key:
 
-    print(
-        "SCAN COMPLETE"
-    )
-
-    print()
-
-    return elapsed
+                last_alert.pop(
+                    symbol,
+                    None
+                )
 
 
 # ============================================================
-# CONTINUOUS LOOP
+# WEBSOCKET
+# ============================================================
+
+def run_websocket(
+    batch,
+    number
+):
+
+    while not stop_event.is_set():
+
+        heartbeat_stop = (
+            threading.Event()
+        )
+
+        def on_open(ws):
+
+            args = [
+                {
+                    "instType": "SPOT",
+                    "channel": WS_CHANNEL,
+                    "instId": symbol,
+                }
+                for symbol in batch
+            ]
+
+            ws.send(
+                json.dumps({
+                    "op": "subscribe",
+                    "args": args
+                })
+            )
+
+            print(
+                f"WS {number}: "
+                f"LIVE | "
+                f"{len(batch)} pairs"
+            )
+
+            def heartbeat():
+
+                while not heartbeat_stop.wait(
+                    PING_SECONDS
+                ):
+
+                    try:
+
+                        ws.send(
+                            "ping"
+                        )
+
+                    except Exception:
+
+                        break
+
+            threading.Thread(
+                target=heartbeat,
+                daemon=True
+            ).start()
+
+        def on_message(
+            ws,
+            message
+        ):
+
+            if message == "pong":
+
+                return
+
+            try:
+
+                data = json.loads(
+                    message
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
+                return
+
+            if (
+                data.get("event")
+                == "error"
+            ):
+
+                print(
+                    f"WS {number} "
+                    f"error: {data}"
+                )
+
+                return
+
+            if data.get(
+                "action"
+            ) not in (
+                "snapshot",
+                "update"
+            ):
+
+                return
+
+            symbol = (
+                data
+                .get("arg", {})
+                .get("instId")
+            )
+
+            if not symbol:
+
+                return
+
+            rows = data.get(
+                "data",
+                []
+            )
+
+            for row in rows:
+
+                handle_candle(
+                    symbol,
+                    row
+                )
+
+        def on_error(
+            ws,
+            error
+        ):
+
+            print(
+                f"WS {number} error: "
+                f"{error}"
+            )
+
+        def on_close(
+            ws,
+            code,
+            message
+        ):
+
+            heartbeat_stop.set()
+
+            print(
+                f"WS {number} closed: "
+                f"{code} "
+                f"{message}"
+            )
+
+        try:
+
+            app = websocket.WebSocketApp(
+                WS_URL,
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+            )
+
+            app.run_forever(
+                ping_interval=None,
+                ping_timeout=None,
+                skip_utf8_validation=True
+            )
+
+        except Exception as error:
+
+            print(
+                f"WS {number} exception: "
+                f"{error}"
+            )
+
+        heartbeat_stop.set()
+
+        if not stop_event.is_set():
+
+            time.sleep(
+                RECONNECT_DELAY
+            )
+
+
+# ============================================================
+# START WEBSOCKETS
+# ============================================================
+
+def start_websockets(
+    symbols
+):
+
+    batches = [
+        symbols[
+            i:i + CHANNELS_PER_WS
+        ]
+        for i in range(
+            0,
+            len(symbols),
+            CHANNELS_PER_WS
+        )
+    ]
+
+    print(
+        f"Starting "
+        f"{len(batches)} "
+        f"live WebSocket connections..."
+    )
+
+    for number, batch in enumerate(
+        batches,
+        1
+    ):
+
+        threading.Thread(
+            target=run_websocket,
+            args=(
+                batch,
+                number
+            ),
+            daemon=True
+        ).start()
+
+        time.sleep(
+            0.15
+        )
+
+    return len(batches)
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
@@ -1444,19 +1454,20 @@ def main():
     print()
 
     print(
-        "======================================================"
+        "=" * 70
     )
 
     print(
-        "BITGET REAL-TIME EMA SCANNER"
+        "BITGET EMA20 / EMA50 "
+        "REAL-TIME SCANNER"
     )
 
     print(
-        "======================================================"
+        "=" * 70
     )
 
     print(
-        "Scan target: EVERY 30 SECONDS"
+        "Exchange: BITGET SPOT"
     )
 
     print(
@@ -1464,103 +1475,141 @@ def main():
     )
 
     print(
-        "EMA20/EMA50: ENABLED"
+        "EMA FAST: 20"
     )
 
     print(
-        "ADX: ENABLED"
-    )
-
-    print(
-        "MARKET STRUCTURE: ENABLED"
-    )
-
-    print(
-        "VOLUME: ENABLED"
-    )
-
-    print(
-        "RSI: DISABLED"
-    )
-
-    print(
-        "FORMING CANDLE: ENABLED"
-    )
-
-    print(
-        "CLOSED CANDLE: ENABLED"
-    )
-
-    print(
-        f"CONCURRENT WORKERS: "
-        f"{MAX_WORKERS}"
+        "EMA SLOW: 50"
     )
 
     print()
 
-    while True:
+    print(
+        "FORMING CANDLE: ON"
+    )
 
-        cycle_start = time.monotonic()
+    print(
+        "IMPENDING CROSS: ON"
+    )
+
+    print(
+        "MARKET CONDITION: ON"
+    )
+
+    print(
+        "SIDEWAYS SIGNALS: OFF"
+    )
+
+    print()
+
+    print(
+        "ADX: OFF"
+    )
+
+    print(
+        "VOLUME: OFF"
+    )
+
+    print(
+        "MARKET STRUCTURE: OFF"
+    )
+
+    print()
+
+    print(
+        "Watching TRENDING MARKETS ONLY"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    while not stop_event.is_set():
 
         try:
 
-            elapsed = scan_market()
+            symbols = get_symbols()
+
+            print()
+
+            print(
+                f"Found "
+                f"{len(symbols)} "
+                f"online USDT Spot pairs."
+            )
+
+            load_history(
+                symbols
+            )
+
+            connections = (
+                start_websockets(
+                    symbols
+                )
+            )
+
+            print()
+
+            print(
+                "=================================================="
+            )
+
+            print(
+                f"SCANNER LIVE | "
+                f"{len(symbols)} pairs | "
+                f"{connections} WebSockets"
+            )
+
+            print(
+                "REAL-TIME FORMING 30-MINUTE CANDLES"
+            )
+
+            print(
+                "TRENDING MARKETS ONLY"
+            )
+
+            print(
+                "IMPENDING + ACTUAL CROSSOVERS"
+            )
+
+            print(
+                "=================================================="
+            )
+
+            # ------------------------------------------------
+            # Keep process alive.
+            # ------------------------------------------------
+
+            while not stop_event.is_set():
+
+                time.sleep(
+                    30
+                )
+
+        except KeyboardInterrupt:
+
+            stop_event.set()
+
+            print(
+                "Scanner stopped."
+            )
+
+            return
 
         except Exception as error:
 
+            print()
+
             print(
-                "SCAN ERROR:",
-                error
-            )
-
-            elapsed = (
-                time.monotonic()
-                - cycle_start
-            )
-
-        # ----------------------------------------------------
-        # NEVER OVERLAP SCANS
-        #
-        # If scan takes 30 seconds or more, immediately start
-        # the next scan.
-        # ----------------------------------------------------
-
-        wait_time = max(
-            0,
-            SCAN_INTERVAL - elapsed
-        )
-
-        if wait_time > 0:
-
-            next_scan = datetime.fromtimestamp(
-                time.time() + wait_time,
-                tz=timezone.utc
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S UTC"
+                f"MAIN ERROR: {error}"
             )
 
             print(
-                f"Next scan: "
-                f"{next_scan}"
-            )
-
-            print(
-                f"Waiting "
-                f"{wait_time:.1f} seconds..."
+                "Retrying in 10 seconds..."
             )
 
             time.sleep(
-                wait_time
-            )
-
-        else:
-
-            print(
-                "Scan exceeded target interval."
-            )
-
-            print(
-                "Starting next scan immediately..."
+                10
             )
 
 
