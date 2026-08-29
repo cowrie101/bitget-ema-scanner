@@ -2137,7 +2137,7 @@ def main():
         f"Pairs: {len(symbols)}"
     )
 
-    prprint(
+    print(
     "WebSocket connections:",
     (len(symbols) + WS_PAIRS_PER_CONNECTION - 1)
     // WS_PAIRS_PER_CONNECTION
